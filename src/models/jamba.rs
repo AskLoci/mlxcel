@@ -591,45 +591,40 @@ impl JambaMambaMixer {
             return (y, updated_t);
         }
 
-        // Sequential scan through timesteps (runs regardless of initial state)
-        // Python: for t in range(T): if state: new_state[:,t] = state*dtA[:,t] + new_state[:,t]; state = new_state[:,t]
+        // Sequential scan through timesteps. Each step reads the output row
+        // `y_t = state_t @ C_t` right away, the same per-step product the
+        // single-token branch above computes, and the rows are stacked once at
+        // the end. Materializing every `[B, D, N]` state and concatenating it
+        // one step at a time (as this used to) re-copied the growing tensor on
+        // every step, which made prefill quadratic in the prompt length.
         let mut current_state = state.map(mlxcel_core::copy);
-        let mut updated_states: Vec<UniquePtr<MlxArray>> = Vec::new();
+        let mut y_steps: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(seq_len as usize);
 
         for t in 0..seq_len {
-            let new_state_t = slice_axis(&new_state, 1, t, t + 1);
-            let new_state_t = mlxcel_core::squeeze_axis(&new_state_t, 1);
-            let dt_a_t = slice_axis(&dt_a, 1, t, t + 1);
-            let dt_a_t = mlxcel_core::squeeze_axis(&dt_a_t, 1);
-
+            let new_state_t = mlxcel_core::squeeze_axis(&slice_axis(&new_state, 1, t, t + 1), 1);
             let updated_t = if let Some(ref prev) = current_state {
                 // new_state[:, t] = state * dtA[:, t] + new_state[:, t]
+                let dt_a_t = mlxcel_core::squeeze_axis(&slice_axis(&dt_a, 1, t, t + 1), 1);
                 let prev_contrib = mlxcel_core::multiply(prev, &dt_a_t);
                 mlxcel_core::add(&prev_contrib, &new_state_t)
             } else {
                 new_state_t
             };
 
-            // state = new_state[:, t]
-            current_state = Some(mlxcel_core::copy(&updated_t));
-            updated_states.push(mlxcel_core::expand_dims(&updated_t, 1));
+            let c_t = mlxcel_core::squeeze_axis(&slice_axis(&c, 1, t, t + 1), 1);
+            let c_exp = mlxcel_core::reshape(&c_t, &[batch, self.ssm_state_size as i32, 1]);
+            y_steps.push(mlxcel_core::squeeze_axis(
+                &mlxcel_core::matmul(&updated_t, &c_exp),
+                -1,
+            ));
+            current_state = Some(updated_t);
         }
 
-        // Stack all updated states
-        let final_new_state = if updated_states.len() == 1 {
-            mlxcel_core::copy(updated_states[0].as_ref().unwrap())
-        } else {
-            let mut result = mlxcel_core::copy(updated_states[0].as_ref().unwrap());
-            for st in updated_states.iter().skip(1) {
-                result = concatenate(&result, st.as_ref().unwrap(), 1);
-            }
-            result
-        };
-
-        // y = (new_state @ C[..., None]).squeeze(-1)
-        let c_exp = mlxcel_core::reshape(&c, &[batch, seq_len, self.ssm_state_size as i32, 1]);
-        let y = mlxcel_core::matmul(&final_new_state, &c_exp);
-        let y = mlxcel_core::squeeze_axis(&y, -1);
+        let y_ptrs: Vec<*const MlxArray> = y_steps
+            .iter()
+            .map(|arr| arr.as_ref().unwrap() as *const MlxArray)
+            .collect();
+        let y = mlxcel_core::stack(&y_ptrs, 1);
 
         // y = y + D * x
         let d_reshaped =

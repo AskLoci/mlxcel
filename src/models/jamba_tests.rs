@@ -530,3 +530,111 @@ fn jamba_prefill_rows_match_token_by_token_decode() {
         }
     }
 }
+
+/// One Mamba layer (`attn_layer_period` 2, offset 1 puts attention at layer 1,
+/// which a one-layer model never reaches) with a dense MoE feed-forward.
+fn mamba_config() -> JambaConfig {
+    serde_json::from_str(&format!(
+        r#"{{
+            "model_type": "jamba",
+            "hidden_size": {HIDDEN},
+            "intermediate_size": {INTERMEDIATE},
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "vocab_size": {VOCAB},
+            "attn_layer_period": 2,
+            "attn_layer_offset": 1,
+            "expert_layer_period": 1,
+            "expert_layer_offset": 0,
+            "num_experts": {EXPERTS},
+            "num_experts_per_tok": 2,
+            "mamba_d_state": 8,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "mamba_dt_rank": 8,
+            "mamba_conv_bias": true,
+            "tie_word_embeddings": true,
+            "quantization": {{"group_size": 0, "bits": 0}}
+        }}"#
+    ))
+    .expect("jamba Mamba test config")
+}
+
+fn mamba_weights() -> WeightMap {
+    let (h, i, n, r, k) = (HIDDEN, 2 * HIDDEN, 8, 8, 4);
+    let mut weights = dense_expert_weights();
+    weights.insert("model.embed_tokens.weight".into(), varied(&[VOCAB, h], 1));
+    let m = "model.layers.0.mamba";
+    for (name, shape, seed) in [
+        ("in_proj.weight", vec![2 * i, h], 21u64),
+        ("x_proj.weight", vec![r + 2 * n, i], 22),
+        ("dt_proj.weight", vec![i, r], 23),
+        ("dt_proj.bias", vec![i], 24),
+        ("conv1d.weight", vec![i, k, 1], 25),
+        ("conv1d.bias", vec![i], 26),
+        ("A_log", vec![i, n], 27),
+        ("D", vec![i], 28),
+        ("out_proj.weight", vec![h, i], 29),
+    ] {
+        weights.insert(format!("{m}.{name}"), varied(&shape, seed));
+    }
+    for (name, dim) in [("dt_layernorm", r), ("b_layernorm", n), ("c_layernorm", n)] {
+        put_f32(&mut weights, &format!("{m}.{name}.weight"), &[dim], 1.0);
+    }
+    weights
+}
+
+/// Issue #1999: the multi-token Mamba scan (the prefill branch of
+/// `JambaMambaMixer::ssm_step`) must give, row for row, what the single-token
+/// branch gives when the same tokens are decoded one at a time, both from an
+/// empty state and continuing from an existing conv and SSM state.
+#[test]
+fn jamba_mamba_prefill_rows_match_token_by_token_decode() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+
+    let build = || {
+        JambaModel::from_weights(mamba_config(), mamba_weights())
+            .expect("Mamba Jamba fixture must load")
+    };
+    let vocab = VOCAB as usize;
+    for (case, (warm, chunk)) in [(0usize, 7usize), (3, 6)].into_iter().enumerate() {
+        let tokens: Vec<i32> = (0..(warm + chunk) as i32)
+            .map(|i| (i * 7 + 3) % VOCAB)
+            .collect();
+
+        let reference = build();
+        let seq_ref = SequenceId::from_raw(1_999_000 + case as u64);
+        reference.prepare_sequence_state(seq_ref);
+        let want: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&t| {
+                let x = mlxcel_core::from_slice_i32(&[t], &[1, 1]);
+                to_f32(&reference.forward_with_sequence_id(&x, Some(seq_ref), &mut [], None))
+            })
+            .collect();
+
+        let model = build();
+        let seq = SequenceId::from_raw(1_999_100 + case as u64);
+        model.prepare_sequence_state(seq);
+        if warm > 0 {
+            let x = mlxcel_core::from_slice_i32(&tokens[..warm], &[1, warm as i32]);
+            let _ = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        }
+        let x = mlxcel_core::from_slice_i32(&tokens[warm..], &[1, chunk as i32]);
+        let got = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        assert_eq!(got.len(), chunk * vocab, "case {case}: logits shape");
+        for row in 0..chunk {
+            let max = got[row * vocab..(row + 1) * vocab]
+                .iter()
+                .zip(&want[warm + row])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max < 1e-4,
+                "warm {warm} chunk {chunk} row {row}: max |diff| {max}"
+            );
+        }
+    }
+}

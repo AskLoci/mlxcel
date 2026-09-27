@@ -203,7 +203,7 @@ fn rnn_scan(
             mlxcel_core::zeros(&[batch, d], mlxcel_core::array_dtype(x))
         };
 
-        let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::new();
+        let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(seq_len);
 
         for t in 0..seq_len {
             let x_t = slice_axis(x, 1, t as i32, (t + 1) as i32);
@@ -214,14 +214,13 @@ fn rnn_scan(
             let ah = mlxcel_core::multiply(&a_t, &h_t);
             h_t = mlxcel_core::add(&ah, &x_t);
 
-            outputs.push(mlxcel_core::expand_dims(&h_t, 1));
+            outputs.push(mlxcel_core::copy(&h_t));
         }
 
-        // Concatenate outputs along time dimension
-        let mut y = mlxcel_core::copy(&outputs[0]);
-        for out in outputs.iter().skip(1) {
-            y = concatenate(&y, out, 1);
-        }
+        // Stack the per-step outputs along time once. Folding them with one
+        // `concatenate` per step re-copied the growing tensor every step, which
+        // is quadratic in the prompt length (issue #1999).
+        let y = mlxcel_core::utils::stack_arrays(&outputs, 1);
 
         (y, h_t)
     }
