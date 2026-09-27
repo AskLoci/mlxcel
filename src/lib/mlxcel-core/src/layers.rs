@@ -769,10 +769,17 @@ fn dense_gemm(
 /// Issue #905's measure-then-keep policy says a fusion lands unwired unless
 /// the microbench shows a win, so the kernel ships available but off, matching
 /// how `MLXCEL_FUSED_QK_NORM` (#326) shipped after the same outcome. Set
-/// `MLXCEL_FUSED_ADD_RMSNORM=1` to opt in. Flip this constant to `true` if a
-/// quiet host, a harness that amortizes dispatch cost, or another backend
-/// demonstrates a win. See
-/// `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md`.
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` to opt in.
+///
+/// The production decode path confirms it (M1 Ultra, `mlxcel-bench-decode`
+/// pp512/tg128, off/on alternated four times each, fused kernel proven to run
+/// only in the on arm): Llama 3.1 8B decode 113.18 vs 113.01 tok/s (-0.15%),
+/// Qwen2.5 7B 115.38 vs 115.34, prefill unchanged, greedy identical. One add
+/// and one RMSNorm per serial block join do not move decode; the Cohere2
+/// fusion that gained (+1.1 to 2.7%) merged two adds and a LayerNorm in a
+/// parallel block. Flip this constant only on a backend that measures a win.
+/// See `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md` and
+/// `docs/benchmark_results/fused-add-rmsnorm-decode-m1ultra-2026-09-27.md`.
 pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
 
 /// Default for the fused q/k RoPE + KV-append-layout decode path. Same
