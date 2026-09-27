@@ -1084,13 +1084,20 @@ impl NemotronHAttention {
         };
 
         // Scaled dot-product attention (MLX fast kernel, handles GQA internally)
-        let mask_ptr = mask
-            .map(|m| m as *const MlxArray)
-            .unwrap_or(std::ptr::null());
-        let output = unsafe {
-            mlxcel_core::layers::attention_from_ptr(
-                &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
-            )
+        // A multi-token forward with no mask is a causal prefill; the
+        // unmasked `attention_from_ptr` path is not causal, so take MLX's
+        // maskless causal SDPA mode explicitly.
+        let output = if mask.is_none() && seq_len > 1 {
+            mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
+        } else {
+            let mask_ptr = mask
+                .map(|m| m as *const MlxArray)
+                .unwrap_or(std::ptr::null());
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
+                )
+            }
         };
 
         let output = mlxcel_core::transpose_axes(&output, &[0, 2, 1, 3]);
@@ -2047,20 +2054,13 @@ impl NemotronHModel {
 
         let mut h = starting_hidden;
 
-        // Find first attention cache offset
-        let attn_offset = caches
-            .iter()
-            .find(|c| matches!(c, NemotronLayerCache::Attention(_)))
-            .map(|c| c.offset())
-            .unwrap_or(0);
-
         let shape = mlxcel_core::array_shape(&h);
         let seq_len = shape[1];
-        let attn_mask = if seq_len > 1 {
-            Some(create_causal_mask(seq_len, attn_offset))
-        } else {
-            None
-        };
+        // No attention mask: the prefill mask would be plain bottom-right
+        // causal (full attention, no window), so the attention layers take
+        // MLX's maskless causal SDPA for multi-token inputs instead of reading
+        // an `[L, L + offset]` array, as mlx-lm passes `"causal"`.
+        let attn_mask: Option<UniquePtr<MlxArray>> = None;
 
         // On M5 Max (Metal GPU Family 4), the lazy evaluation graph for 52
         // hybrid SSM+MoE layers can exceed the Metal command buffer capacity,

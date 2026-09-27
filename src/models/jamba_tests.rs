@@ -440,3 +440,93 @@ fn jamba_rejects_a_declared_quantization_mode_its_loaders_cannot_honor() {
         Err(e) => panic!("an explicitly declared affine mode must load: {e}"),
     }
 }
+
+/// Seeded small-magnitude values, so positions differ and a non-causal
+/// attention would change the prefill rows.
+fn varied(shape: &[i32], seed: u64) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let len: usize = shape.iter().map(|d| *d as usize).product();
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    let data: Vec<f32> = (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32) / ((1u32 << 24) as f32) * 0.4 - 0.2
+        })
+        .collect();
+    mlxcel_core::from_slice_f32(&data, shape)
+}
+
+fn to_f32(arr: &mlxcel_core::MlxArray) -> Vec<f32> {
+    let arr = mlxcel_core::astype(arr, dtype::FLOAT32);
+    mlxcel_core::eval(&arr);
+    mlxcel_core::array_to_raw_bytes(&arr)
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Issue #1991: Jamba prefill passes no attention mask and the attention
+/// layer takes MLX's maskless causal SDPA. Each prefill row must match the
+/// same position decoded one token at a time, fresh and continued from an
+/// offset. Varied embeddings and projections make a non-causal pass differ.
+#[test]
+fn jamba_prefill_rows_match_token_by_token_decode() {
+    use mlxcel_core::cache::SequenceId;
+    use mlxcel_core::generate::LanguageModel;
+
+    let build = || {
+        let mut weights = dense_expert_weights();
+        weights.insert(
+            "model.embed_tokens.weight".into(),
+            varied(&[VOCAB, HIDDEN], 1),
+        );
+        for (i, proj) in ["q_proj", "k_proj", "v_proj", "o_proj"].iter().enumerate() {
+            weights.insert(
+                format!("model.layers.0.self_attn.{proj}.weight"),
+                varied(&[HIDDEN, HIDDEN], 10 + i as u64),
+            );
+        }
+        JambaModel::from_weights(moe_config(&quant_block(0, 0)), weights)
+            .expect("dense Jamba fixture must load")
+    };
+    let vocab = VOCAB as usize;
+    for (case, (warm, chunk)) in [(0usize, 6usize), (3, 5)].into_iter().enumerate() {
+        let tokens: Vec<i32> = (0..(warm + chunk) as i32)
+            .map(|i| (i * 5 + 1) % VOCAB)
+            .collect();
+
+        let reference = build();
+        let seq_ref = SequenceId::from_raw(1_991_000 + case as u64);
+        reference.prepare_sequence_state(seq_ref);
+        let want: Vec<Vec<f32>> = tokens
+            .iter()
+            .map(|&t| {
+                let x = mlxcel_core::from_slice_i32(&[t], &[1, 1]);
+                to_f32(&reference.forward_with_sequence_id(&x, Some(seq_ref), &mut [], None))
+            })
+            .collect();
+
+        let model = build();
+        let seq = SequenceId::from_raw(1_991_100 + case as u64);
+        model.prepare_sequence_state(seq);
+        if warm > 0 {
+            let x = mlxcel_core::from_slice_i32(&tokens[..warm], &[1, warm as i32]);
+            let _ = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        }
+        let x = mlxcel_core::from_slice_i32(&tokens[warm..], &[1, chunk as i32]);
+        let got = to_f32(&model.forward_with_sequence_id(&x, Some(seq), &mut [], None));
+        assert_eq!(got.len(), chunk * vocab, "case {case}: logits shape");
+        for row in 0..chunk {
+            let max = got[row * vocab..(row + 1) * vocab]
+                .iter()
+                .zip(&want[warm + row])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max < 1e-4,
+                "warm {warm} chunk {chunk} row {row}: max |diff| {max}"
+            );
+        }
+    }
+}

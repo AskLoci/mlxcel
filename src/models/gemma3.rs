@@ -315,19 +315,29 @@ impl Attention {
         // Update KV cache and get sliced views
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
-        // Use fused scaled dot-product attention (handles GQA internally)
-        let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
-        let attn_out = unsafe {
-            mlxcel_core::layers::attention_from_ptr(
-                &q,
-                &cache_k,
-                &cache_v,
-                self.scale,
-                mask_ptr,
-                0.0,
-                self.window_size,
-            )
-        };
+        // Use fused scaled dot-product attention (handles GQA internally).
+        // A multi-token forward with no mask is a prefill whose mask would be
+        // plain causal: every live key is inside this layer's window (or the
+        // layer is global). `attention_from_ptr` with no mask is not causal,
+        // so take MLX's maskless causal SDPA mode explicitly.
+        let k_len = mlxcel_core::array_shape(&cache_k)[2];
+        let attn_out =
+            if mask.is_none() && l > 1 && (self.window_size == 0 || k_len <= self.window_size) {
+                mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
+            } else {
+                let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+                unsafe {
+                    mlxcel_core::layers::attention_from_ptr(
+                        &q,
+                        &cache_k,
+                        &cache_v,
+                        self.scale,
+                        mask_ptr,
+                        0.0,
+                        self.window_size,
+                    )
+                }
+            };
 
         // Transpose back and reshape
         let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
@@ -1069,17 +1079,27 @@ impl Gemma3Model {
             // byte-identical to the untrimmed path. RoPE keeps reading each
             // layer's own monotonic `offset` inside the attention layer. See
             // issue #430 (mirrors #419/#420, #421/#422).
-            let global_idx = self.sliding_window_pattern - 1;
-            let global_live_len = caches[global_idx].as_interface().live_len();
-            let global_mask = Some(create_causal_mask(seq_len, global_live_len));
+            //
+            // A mask that is plain bottom-right causal is left `None`, and the
+            // attention layer takes MLX's maskless causal SDPA instead of
+            // reading an `[l, l + offset]` array (as mlx-lm passes `"causal"`
+            // for `N <= window`). That is always the case for the global
+            // layers, and for the sliding layers until the live keys outgrow
+            // the window.
+            let global_mask: Option<UniquePtr<MlxArray>> = None;
 
             let sliding_mask = if self.sliding_window_pattern > 1 {
                 let sliding_live_len = caches[0].as_interface().live_len();
-                Some(create_sliding_window_prefill_mask(
-                    seq_len,
-                    sliding_live_len,
-                    self.sliding_window as i32,
-                ))
+                let window = self.sliding_window as i32;
+                if sliding_live_len + seq_len <= window {
+                    None
+                } else {
+                    Some(create_sliding_window_prefill_mask(
+                        seq_len,
+                        sliding_live_len,
+                        window,
+                    ))
+                }
             } else {
                 None
             };

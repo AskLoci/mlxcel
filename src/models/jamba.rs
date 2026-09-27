@@ -470,11 +470,18 @@ impl JambaAttention {
             (keys, values)
         };
 
-        let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
-        let output = unsafe {
-            mlxcel_core::layers::attention_from_ptr(
-                &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
-            )
+        // A multi-token forward with no mask is a causal prefill; the
+        // unmasked `attention_from_ptr` path is not causal, so take MLX's
+        // maskless causal SDPA mode explicitly.
+        let output = if mask.is_none() && seq_len > 1 {
+            mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
+        } else {
+            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
+                )
+            }
         };
 
         // Transpose back and reshape
@@ -766,7 +773,6 @@ struct JambaModelBackbone {
     layers: Vec<JambaDecoderLayer>,
     final_layernorm: RMSNorm,
     layers_block_type: Vec<String>,
-    attn_idx: usize,
 }
 
 impl JambaModelBackbone {
@@ -777,26 +783,11 @@ impl JambaModelBackbone {
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(inputs);
 
-        // Create attention mask
-        let mask = {
-            let shape = mlxcel_core::array_shape(&h);
-            let seq_len = shape[1];
-            if seq_len > 1 {
-                let offset = caches
-                    .as_ref()
-                    .map(|c| {
-                        if self.attn_idx < c.len() {
-                            c[self.attn_idx].offset()
-                        } else {
-                            0
-                        }
-                    })
-                    .unwrap_or(0);
-                Some(create_causal_mask(seq_len, offset))
-            } else {
-                None
-            }
-        };
+        // No attention mask: the prefill mask would be plain bottom-right
+        // causal (full attention, no window), so the attention layers take
+        // MLX's maskless causal SDPA for multi-token inputs instead of reading
+        // an `[L, L + offset]` array, as mlx-lm passes `"causal"`.
+        let mask: Option<UniquePtr<MlxArray>> = None;
 
         if let Some(cache_slice) = caches {
             for (layer, cache) in self.layers.iter().zip(cache_slice.iter_mut()) {
@@ -1048,12 +1039,6 @@ impl JambaModel {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let layers_block_type = config.get_layers_block_type();
 
-        // Find first attention layer index
-        let attn_idx = layers_block_type
-            .iter()
-            .position(|t| t == "attention")
-            .unwrap_or(0);
-
         // Get quantization parameters
         let group_size = config.group_size();
         let bits = config.bits();
@@ -1285,7 +1270,6 @@ impl JambaModel {
             layers,
             final_layernorm,
             layers_block_type,
-            attn_idx,
         };
 
         Ok(Self {

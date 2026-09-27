@@ -2097,16 +2097,18 @@ impl Attention {
         }
 
         // When mask was discarded (undersized) or originally None,
-        // use causal attention if possible.
+        // use causal attention if possible. A multi-token query whose keys all
+        // fit inside a sliding layer's window sees a plain causal mask, so it
+        // takes the maskless causal mode (window 0) instead of building a
+        // windowed mask array inside `causal_attention`.
         if local_mask.is_none() {
-            return mlxcel_core::causal_attention(
-                queries,
-                keys,
-                values,
-                self.scale,
-                0.0,
-                self.window_size,
-            );
+            let key_len = mlxcel_core::array_shape(keys)[2];
+            let window = if query_len > 1 && self.window_size > 0 && key_len <= self.window_size {
+                0
+            } else {
+                self.window_size
+            };
+            return mlxcel_core::causal_attention(queries, keys, values, self.scale, 0.0, window);
         }
 
         let mask_ptr = local_mask
@@ -3534,6 +3536,26 @@ impl Gemma4TextModel {
             // padding / vision-overlay shape keep the dense masks below,
             // byte-identical to the previous behavior.
             (None, None)
+        } else if l > 1 && bidirectional_block_ids.is_none() && per_row_valid_end.is_none() {
+            // Text-only prefill / verify with no padding: both masks would be
+            // plain bottom-right causal while every live key is inside the
+            // window, so leave them `None` and let `attend` take MLX's
+            // maskless causal SDPA (mlx-lm passes `"causal"` for `N <=
+            // window`). Full-attention layers always qualify; sliding layers
+            // until the live keys outgrow the window, after which they keep
+            // the dense sliding mask built as in the branch below.
+            let sliding_live_len = first_cache_live_len(caches, "sliding_attention");
+            let window = self.config.sliding_window as i32;
+            let sliding_mask = if sliding_live_len + l <= window {
+                None
+            } else {
+                Some(create_sliding_window_prefill_mask(
+                    l,
+                    sliding_live_len,
+                    window,
+                ))
+            };
+            (None, sliding_mask)
         } else if l > 1 {
             // Non-ragged prefill / multi-token verify: derive both masks from
             // the cache's live window (`live_len`), not the monotonic

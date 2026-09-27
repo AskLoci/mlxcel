@@ -645,6 +645,48 @@ mod snapshot_prompt_cache {
             "unexpected error: {err}"
         );
     }
+
+    /// Issue #1991: a multi-token forward whose mask would be plain causal
+    /// runs with no mask array and MLX's maskless causal SDPA. Each prefill
+    /// row must match the same position decoded one token at a time (the
+    /// decode path does not change), for a fresh prefill inside the window, a
+    /// continued prefill with an offset inside the window, and prefills past
+    /// the 8-token window where the sliding layer keeps its mask and the
+    /// global layer still goes maskless.
+    #[test]
+    fn prefill_rows_match_token_by_token_decode() {
+        let vocab = VOCAB as usize;
+        for (case, (warm, chunk)) in [(0usize, 6usize), (3, 4), (0, 12), (5, 6)]
+            .into_iter()
+            .enumerate()
+        {
+            let tokens = ids(0..(warm + chunk) as i32);
+
+            let reference = build_wrapper();
+            let seq_ref = SequenceId::from_raw(SEQ_BASE + 40 + case as u64);
+            reference.prepare_sequence_state(seq_ref);
+            let want: Vec<Vec<f32>> = tokens
+                .iter()
+                .map(|&t| decode(&reference, seq_ref, t))
+                .collect();
+
+            let model = build_wrapper();
+            let seq = SequenceId::from_raw(SEQ_BASE + 50 + case as u64);
+            model.prepare_sequence_state(seq);
+            if warm > 0 {
+                let _ = append_prefill(&model, seq, &tokens[..warm]);
+            }
+            let got = append_prefill(&model, seq, &tokens[warm..]);
+            assert_eq!(got.len(), chunk * vocab, "case {case}: logits shape");
+            for row in 0..chunk {
+                assert_logits_agree(
+                    &got[row * vocab..(row + 1) * vocab],
+                    &want[warm + row],
+                    &format!("warm {warm} chunk {chunk} row {row}"),
+                );
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------
