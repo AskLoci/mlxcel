@@ -49,19 +49,49 @@ tok/s, two runs per arm.
 Decode is unchanged in every cell. Qwen3 is the bf16-scale control: it stays on
 `quantized_matmul`.
 
-## Correctness
+## bf16 checkpoints and the exactness guard (issue #2001, 2026-09-28)
+
+bf16-scale checkpoints also run bf16 activations, and with matching dtypes the
+dense path reconstructs the same weight `quantized_matmul` does. An in-tree
+sweep (f16 and bf16; M 1024 and 2048; K 2048, 2560, 4096; N 256 to 4096) found
+identical bytes whenever the output has more than 512 tiles of 32 x 32, and
+differences only at or below 512 tiles (M 1024 with N 512 or narrower, M 2048
+with N 256). The path now requires matching f16 or bf16 dtypes and more than
+512 output tiles, so wherever it runs it returns the same bytes as
+`quantized_matmul`. The Gemma 4 E4B logit differences reported below came from
+its narrow projections in that region, where bf16's larger ulp made one
+rounding step visible.
+
+Main-branch binary with the path forced off (`MLXCEL_PREFILL_DEQUANT_MIN_M=0`)
+against on (`=256`), prefill time, mean of two runs per arm, GEMM check 12.9 to
+14.0 TFLOPS:
+
+| Model | Scales | pp512 | pp1024 | pp2048 |
+|---|---|---|---|---|
+| Qwen3 1.7B | bf16 | +12.8% | +15.1% | +18.0% |
+| Qwen3-30B-A3B | bf16 | +2.3% | +5.5% | +4.4% |
+| Gemma 4 12B | bf16 | -1.0% | +3.0% | +3.2% |
+| Gemma 4 E4B | bf16 | -2.7% | +0.9% | +1.9% |
+| Gemma 3 4B | bf16 | -1.1% | +0.5% | +0.8% |
+| Llama 3.1 8B | f16 | +5.3% | +9.7% | +11.7% |
+| Qwen2.5 7B | f16 | -4.2% | +0.6% | +3.0% |
+
+No model regresses at 1024 rows or more, so the M1 gate and the 1024-row
+threshold stand for both dtypes. Greedy output with the path off and on is
+identical on all seven with a prompt above 1024 tokens.
+
 
 - f16 scales: teacher-forced logit traces (1024 tokens × 2, top-8, six
   decimals) are byte-identical files with the path on and off for Llama 3.1 8B
   and Qwen2.5 7B, and perplexity matches (9.9874, 8.2434). Greedy output is
   identical to main on Llama 3.1 8B, Qwen2.5 7B, command-r7b, Phi-3 mini,
   Gemma 2 2B and Mixtral 8x7B with a prompt above 1024 tokens.
-- The kernels differ only in accumulation order. A unit test finds identical
-  bytes at K 4096 × N 1024 and at most one f16 rounding step at N 512, where
-  MLX tiles the two differently.
-- bf16 scales: the dense weight rounds to bf16. On Gemma 4 E4B this moved
-  2.7% of top-1 choices, max logit delta 4.87, so bf16-scale projections are
-  excluded.
+- The kernels differ only in how MLX tiles the output. A unit test checks
+  identical bytes for f16 and bf16 above 512 output tiles and that narrower
+  outputs and mixed dtypes are not eligible (see the #2001 section above).
+- The first version ran bf16-scale projections regardless of width, and on
+  Gemma 4 E4B that moved 2.7% of top-1 choices (max logit delta 4.87). The
+  cause was the narrow projections, not bf16 itself.
 
 ## Excluded data
 

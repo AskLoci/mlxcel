@@ -484,9 +484,12 @@ pub fn decode_mb_per_buffer() -> Option<u32> {
     })
 }
 
-/// Lowest input row count at which an f16-scale affine projection runs as
-/// `dequantize` + dense f16 matmul instead of `quantized_matmul`, on the
-/// Apple generations where that was measured to be no slower (issue #1994).
+/// Lowest input row count at which an affine projection whose scales share the
+/// input's dtype (f16 or bf16) runs as `dequantize` + dense matmul instead of
+/// `quantized_matmul`, on the Apple generations where that was measured to be
+/// no slower (issues #1994, #2001). bf16-scale models at 1024 / 2048 rows:
+/// Qwen3 1.7B +15.1% / +18.0%, Qwen3-30B-A3B +5.5% / +4.4%, Gemma 4 12B +3.0% /
+/// +3.2%, Gemma 4 E4B +0.9% / +1.9%, Gemma 3 4B +0.5% / +0.8%.
 ///
 /// Measured on M1 Ultra through `mlxcel-bench-decode` (prefill change, dense
 /// path on vs off, one binary): at 1024 rows Llama 3.1 8B +10.0%, command-r7b
