@@ -484,6 +484,76 @@ pub fn decode_mb_per_buffer() -> Option<u32> {
     })
 }
 
+/// Lowest input row count at which an f16-scale affine projection runs as
+/// `dequantize` + dense f16 matmul instead of `quantized_matmul`, on the
+/// Apple generations where that was measured to be no slower (issue #1994).
+///
+/// Measured on M1 Ultra through `mlxcel-bench-decode` (prefill change, dense
+/// path on vs off, one binary): at 1024 rows Llama 3.1 8B +10.0%, command-r7b
+/// +7.7%, Phi-3 mini +10.2%, Qwen2.5 7B +1.5%, Gemma 2 2B +0.6%, Mixtral 8x7B
+/// +0.6%; at 2048 rows +13.5%, +10.2%, +12.5%, +3.9%, +1.0%, +1.2%. Below 1024
+/// the models split: at 512 rows Llama, command-r and Phi-3 gain 4 to 6% while
+/// Qwen2.5 loses 3.1% and Gemma 2 1.3%, and at 384 rows Qwen2.5 loses 11%. 1024
+/// is the lowest row count with no measured regression; a per-shape threshold
+/// could recover the 512 to 768 gains later. Prefill peak memory grows 0.1 to
+/// 0.6 GB. See docs/benchmark_results/prefill-dense-gemm-m1ultra-2026-09-27.md.
+pub const PREFILL_DENSE_GEMM_MIN_ROWS: i64 = 1024;
+
+/// Environment variable that sets the dense-GEMM prefill row threshold on any
+/// backend. `0`, `off`, `false` or `no` disables it; a positive integer
+/// replaces the hardware default.
+pub const PREFILL_DENSE_GEMM_ENV: &str = "MLXCEL_PREFILL_DEQUANT_MIN_M";
+
+/// Hardware default for [`PREFILL_DENSE_GEMM_MIN_ROWS`]: on for M1 only.
+///
+/// Measured on M1 Ultra (the gain above) and M5 Max, where the dense path is
+/// slower at every size tried: Llama 3.1 8B -12.1% / -3.7% / -0.9% at 512 /
+/// 1024 / 2048 rows, Qwen2.5 7B -14.4% / -2.8% / +0.3%, Phi-3 mini -13.8% /
+/// -2.5% / -0.2%, with +0.5 to 0.8 GB of peak memory, so M5 stays off. M2
+/// through M4 differ in GPU microarchitecture and were not measured, and later
+/// or non-Apple devices report `Unknown`; they keep `quantized_matmul` until a
+/// measurement adds them here.
+#[must_use]
+pub fn prefill_dense_gemm_min_rows_default(r#gen: AppleSiliconGen) -> Option<i64> {
+    (r#gen == AppleSiliconGen::M1).then_some(PREFILL_DENSE_GEMM_MIN_ROWS)
+}
+
+/// Resolve the dense-GEMM prefill row threshold from
+/// [`PREFILL_DENSE_GEMM_ENV`] and the hardware default. Pure, so the
+/// precedence is unit-testable. An unparseable value keeps the default.
+#[must_use]
+pub fn resolve_prefill_dense_gemm_min_rows(
+    env_value: Option<&str>,
+    hardware_default: Option<i64>,
+) -> Option<i64> {
+    let Some(value) = env_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return hardware_default;
+    };
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "off" | "false" | "no"
+    ) {
+        return None;
+    }
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .or(hardware_default)
+}
+
+/// The dense-GEMM prefill row threshold for this process, resolved once.
+#[must_use]
+pub fn prefill_dense_gemm_min_rows() -> Option<i64> {
+    static CACHED: OnceLock<Option<i64>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        resolve_prefill_dense_gemm_min_rows(
+            std::env::var(PREFILL_DENSE_GEMM_ENV).ok().as_deref(),
+            prefill_dense_gemm_min_rows_default(get_hardware().silicon_gen),
+        )
+    })
+}
+
 /// The `MLX_CUDA_GRAPH_CACHE_SIZE` default to apply on a CUDA build, or `None`
 /// off CUDA.
 ///
@@ -1288,6 +1358,51 @@ mod tests {
             resolve_decode_mb_per_buffer(Some("50"), Some("2000"), Some(1000)),
             None
         );
+    }
+
+    #[test]
+    fn prefill_dense_gemm_default_is_m1_only() {
+        assert_eq!(
+            prefill_dense_gemm_min_rows_default(AppleSiliconGen::M1),
+            Some(PREFILL_DENSE_GEMM_MIN_ROWS)
+        );
+        for other in [
+            AppleSiliconGen::M2,
+            AppleSiliconGen::M3,
+            AppleSiliconGen::M4,
+            AppleSiliconGen::M5,
+            AppleSiliconGen::Unknown,
+        ] {
+            assert_eq!(
+                prefill_dense_gemm_min_rows_default(other),
+                None,
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_dense_gemm_env_overrides_and_disables() {
+        let d = Some(PREFILL_DENSE_GEMM_MIN_ROWS);
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(None, d), d);
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(Some(""), d), d);
+        assert_eq!(
+            resolve_prefill_dense_gemm_min_rows(Some("512"), d),
+            Some(512)
+        );
+        assert_eq!(
+            resolve_prefill_dense_gemm_min_rows(Some("512"), None),
+            Some(512)
+        );
+        for off in ["0", "off", "FALSE", "no"] {
+            assert_eq!(
+                resolve_prefill_dense_gemm_min_rows(Some(off), d),
+                None,
+                "{off}"
+            );
+        }
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(Some("junk"), d), d);
+        assert_eq!(resolve_prefill_dense_gemm_min_rows(Some("-3"), None), None);
     }
 
     #[test]

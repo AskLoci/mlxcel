@@ -687,6 +687,74 @@ fn fused_qk_norm_enabled_from(value: Option<&str>) -> bool {
 /// rebuild; setting this constant to `false` makes off the default and
 /// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
 ///
+/// Whether [`UnifiedLinear`] should run this quantized projection as
+/// `dequantize` + dense matmul (issue #1994): an affine weight with f16 scales,
+/// an f16 input, a 2-D weight, and at least `min_rows` input rows (the product
+/// of every axis but the last, so a server batch counts all of its rows).
+///
+/// f16 scales make the dequantized f16 weight exact, so the dense matmul
+/// differs from `quantized_matmul` only in accumulation order: identical bytes
+/// at typical projection widths, at most one f16 rounding step at narrow ones,
+/// and identical teacher-forced logits on Llama 3.1 8B and Qwen2.5 7B. bf16
+/// scales would round the dense weight to bf16 and change the logits (Gemma 4
+/// E4B max |delta| 4.9), so those stay on `quantized_matmul`.
+pub(crate) fn prefill_dense_gemm_eligible(
+    x: &MlxArray,
+    weight: &QuantizedWeight,
+    min_rows: i64,
+) -> bool {
+    if weight.mode != "affine"
+        || ffi::array_dtype(&weight.scales) != crate::dtype::FLOAT16
+        || ffi::array_dtype(x) != crate::dtype::FLOAT16
+        || ffi::array_shape(&weight.weight).len() != 2
+    {
+        return false;
+    }
+    let shape = ffi::array_shape(x);
+    let rows: i64 = shape[..shape.len().saturating_sub(1)]
+        .iter()
+        .map(|&d| d as i64)
+        .product();
+    rows >= min_rows
+}
+
+/// `x @ dequantize(W)^T (+ bias)` for a projection that
+/// [`prefill_dense_gemm_eligible`] accepts at the process threshold
+/// ([`crate::hardware::prefill_dense_gemm_min_rows`]); `None` otherwise.
+fn prefill_dense_gemm_forward(
+    x: &MlxArray,
+    weight: &QuantizedWeight,
+    bias: Option<&UniquePtr<MlxArray>>,
+) -> Option<UniquePtr<MlxArray>> {
+    let min_rows = crate::hardware::prefill_dense_gemm_min_rows()?;
+    if !prefill_dense_gemm_eligible(x, weight, min_rows) {
+        return None;
+    }
+    Some(dense_gemm(x, weight, bias))
+}
+
+fn dense_gemm(
+    x: &MlxArray,
+    weight: &QuantizedWeight,
+    bias: Option<&UniquePtr<MlxArray>>,
+) -> UniquePtr<MlxArray> {
+    let dense = unsafe {
+        ffi::dequantize(
+            &weight.weight,
+            &weight.scales,
+            weight.biases_ptr(),
+            weight.group_size,
+            weight.bits,
+            &weight.mode,
+        )
+    };
+    let y = ffi::matmul(x, &ffi::transpose(&dense));
+    match bias {
+        Some(b) => ffi::add(&y, b),
+        None => y,
+    }
+}
+
 /// Default-OFF: measured, and the measurement did not justify wiring it on.
 ///
 /// Op-level microbench on Apple M1 Ultra (Metal, f16, hidden {2048, 4096,
@@ -2328,6 +2396,11 @@ impl UnifiedLinear {
                         Some(b) => ffi::add(&scaled, b),
                         None => scaled,
                     };
+                }
+
+                // Large-M prefill on measured hardware: dense f16 GEMM (#1994).
+                if let Some(y) = prefill_dense_gemm_forward(x, weight, bias.as_ref()) {
+                    return y;
                 }
 
                 let bias_ptr = bias
@@ -5976,6 +6049,110 @@ pub fn compiled_gelu_mlp_fp16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seeded(shape: &[i32], seed: u64) -> UniquePtr<MlxArray> {
+        let len: usize = shape.iter().map(|d| *d as usize).product();
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        let data: Vec<f32> = (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32) / ((1u32 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        ffi::from_slice_f32(&data, shape)
+    }
+
+    fn quantized_4bit(dense: &MlxArray) -> QuantizedWeight {
+        let q = ffi::quantize_weights(dense, 64, 4);
+        QuantizedWeight::new(
+            ffi::quantized_weights_w(&q),
+            ffi::quantized_weights_scales(&q),
+            ffi::quantized_weights_biases(&q),
+            64,
+            4,
+        )
+    }
+
+    fn raw_bytes(arr: &MlxArray) -> Vec<u8> {
+        ffi::eval(arr);
+        ffi::array_to_raw_bytes(arr)
+    }
+
+    /// Issue #1994: for f16 scales and f16 input the dense path matches
+    /// `quantized_matmul`. At a typical projection shape (N = 1024) the bytes
+    /// are identical; at a narrow output (N = 512) MLX picks a different
+    /// tiling and the two differ by at most one f16 rounding step. A bf16-scale
+    /// or bf16-input projection is not eligible, so it stays on
+    /// `quantized_matmul`.
+    #[test]
+    fn prefill_dense_gemm_matches_qmm_and_skips_bf16() {
+        let (rows, k) = (1024, 4096);
+        let x = ffi::astype(&seeded(&[1, rows, k], 11), crate::dtype::FLOAT16);
+        for (n, exact) in [(1024, true), (512, false)] {
+            let w16 = ffi::astype(&seeded(&[n, k], 7), crate::dtype::FLOAT16);
+            let qw = quantized_4bit(&w16);
+            let bias = ffi::astype(&seeded(&[n], 13), crate::dtype::FLOAT16);
+            assert!(prefill_dense_gemm_eligible(&x, &qw, 1024));
+            assert!(!prefill_dense_gemm_eligible(&x, &qw, 1025));
+            for b in [None, Some(&bias)] {
+                let bias_ptr = b
+                    .map(|b| b.as_ref().unwrap() as *const MlxArray)
+                    .unwrap_or(std::ptr::null());
+                let want = unsafe {
+                    ffi::quantized_linear_forward(
+                        &x,
+                        &qw.weight,
+                        &qw.scales,
+                        qw.biases_ptr(),
+                        bias_ptr,
+                        qw.group_size,
+                        qw.bits,
+                        &qw.mode,
+                    )
+                };
+                let got = dense_gemm(&x, &qw, b);
+                if exact {
+                    assert_eq!(
+                        raw_bytes(&got),
+                        raw_bytes(&want),
+                        "N {n} bias {}: dense GEMM must match qmm bytes",
+                        b.is_some()
+                    );
+                } else {
+                    let g = crate::utils::array_to_vec_f32(&got);
+                    let w = crate::utils::array_to_vec_f32(&want);
+                    let scale = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let max = g
+                        .iter()
+                        .zip(&w)
+                        .fold(0f32, |m, (a, c)| m.max((a - c).abs()));
+                    // One f16 step at the output's magnitude (2^-10 relative).
+                    assert!(
+                        max <= scale / 1024.0,
+                        "N {n} bias {}: max |diff| {max} exceeds one f16 step of {scale}",
+                        b.is_some()
+                    );
+                }
+            }
+        }
+
+        let n = 512;
+        let wbf = ffi::astype(&seeded(&[n, k], 7), crate::dtype::BFLOAT16);
+        let qbf = quantized_4bit(&wbf);
+        assert_eq!(ffi::array_dtype(&qbf.scales), crate::dtype::BFLOAT16);
+        let xbf = ffi::astype(&x, crate::dtype::BFLOAT16);
+        assert!(
+            !prefill_dense_gemm_eligible(&x, &qbf, 1),
+            "bf16 scales must stay on qmm"
+        );
+        let qw = quantized_4bit(&ffi::astype(&seeded(&[n, k], 7), crate::dtype::FLOAT16));
+        assert!(
+            !prefill_dense_gemm_eligible(&xbf, &qw, 1),
+            "bf16 input must stay on qmm"
+        );
+    }
 
     /// Pin [`max_abs_attention_score`] against products computed by hand, on
     /// both sides of [`F16_MAX`].
