@@ -1803,6 +1803,28 @@ mod ffi {
             next_state: &mut UniquePtr<MlxArray>,
         );
 
+        /// Whether the fused Mamba1 selective-scan kernel can run (Metal only;
+        /// `MLXCEL_MAMBA1_SCAN_KERNEL=0` forces the graph scan).
+        fn mamba1_scan_kernel_available() -> bool;
+
+        /// Mamba1 selective scan fused over the sequence (issue #2005).
+        /// x, delta `[B, L, D]`, b, c `[B, L, N]`, a `[D, N]` (= -exp(A_log)),
+        /// d `[D]`, state_in `[B, D, N]`. Writes y `[B, L, D]` in x's dtype and
+        /// the final state `[B, D, N]` in float32.
+        /// Used by: Jamba
+        #[allow(clippy::too_many_arguments)]
+        fn mamba1_selective_scan(
+            x: &MlxArray,
+            delta: &MlxArray,
+            b: &MlxArray,
+            c: &MlxArray,
+            a: &MlxArray,
+            d: &MlxArray,
+            state_in: &MlxArray,
+            y: &mut UniquePtr<MlxArray>,
+            state_out: &mut UniquePtr<MlxArray>,
+        );
+
         /// Fused MoE expert kernel for single-token decode. gate/up use
         /// `gu_bits` (power-of-2: 4/8), down uses `d_bits` (4/8/6); group_size
         /// is shared. Mixed widths support e.g. dots.llm1 (gate/up 4, down 6).
@@ -3768,6 +3790,10 @@ mod cuda_test_serialization_tests;
 #[cfg(test)]
 #[path = "fused_norm_parity_tests.rs"]
 mod fused_norm_parity_tests;
+
+#[cfg(test)]
+#[path = "mamba1_scan_parity_tests.rs"]
+mod mamba1_scan_parity_tests;
 
 // Numeric regression tests for `fast::rms_norm` on the small-axis CUDA dispatch
 // band (#830/#831): the deleted pre-#3792 overlay read past its shared scratch

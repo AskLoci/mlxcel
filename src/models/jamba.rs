@@ -553,6 +553,42 @@ impl JambaMambaMixer {
         // delta = softplus(dt_proj(delta))
         let delta = mlxcel_core::softplus(&self.dt_proj.forward(&delta));
 
+        // Fused selective scan (issue #2005): one Metal kernel walks every
+        // timestep with the state in float32 registers, for prefill and decode
+        // alike so the two stay numerically consistent. The graph scan below
+        // remains for other backends and `MLXCEL_MAMBA1_SCAN_KERNEL=0`.
+        if mlxcel_core::mamba1_scan_kernel_available() {
+            let zeros;
+            let state_in = match state {
+                Some(s) => s,
+                None => {
+                    zeros = mlxcel_core::zeros(
+                        &[
+                            batch,
+                            self.intermediate_size as i32,
+                            self.ssm_state_size as i32,
+                        ],
+                        mlxcel_core::dtype::FLOAT32,
+                    );
+                    zeros.as_ref().unwrap()
+                }
+            };
+            let mut y = UniquePtr::null();
+            let mut state_out = UniquePtr::null();
+            mlxcel_core::mamba1_selective_scan(
+                x,
+                &delta,
+                &b,
+                &c,
+                a,
+                &self.d_param,
+                state_in,
+                &mut y,
+                &mut state_out,
+            );
+            return (y, state_out);
+        }
+
         // new_state = (delta * x)[..., None] * B[..., None, :]
         let delta_x = mlxcel_core::multiply(&delta, x);
         let delta_x_exp = mlxcel_core::reshape(

@@ -1891,6 +1891,23 @@ std::unique_ptr<MlxArray> fused_moe_forward(
 // Check if SSM Metal kernel is available (Metal GPU only)
 bool ssm_kernel_available();
 
+// Mamba1 selective scan fused over the sequence (Jamba, issue #2005).
+// x, delta: [batch, seq, d]; b, c: [batch, seq, n]; a: [d, n] (= -exp(A_log));
+// d: [d]; state_in: [batch, d, n]. y: [batch, seq, d] in x's dtype; state_out:
+// [batch, d, n] float32.
+bool mamba1_scan_kernel_available();
+void mamba1_selective_scan(
+    const MlxArray& x,
+    const MlxArray& delta,
+    const MlxArray& b,
+    const MlxArray& c,
+    const MlxArray& a,
+    const MlxArray& d,
+    const MlxArray& state_in,
+    std::unique_ptr<MlxArray>& y,
+    std::unique_ptr<MlxArray>& state_out
+);
+
 // Compiled MoE gate: sigmoid scoring + bias + topk + normalize + scale
 // Matches Python @mx.compile group_expert_select()
 // Returns (topk_indices, topk_scores) via output pointers

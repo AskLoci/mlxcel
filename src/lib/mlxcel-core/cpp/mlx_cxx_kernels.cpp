@@ -1628,6 +1628,148 @@ void ssm_update_kernel(
     next_state = std::make_unique<MlxArray>(std::move(results[1]));
 }
 
+// Mamba1 selective scan (Jamba), fused over the whole sequence (issue #2005).
+//
+// The graph path runs one small group of ops per timestep per layer. This
+// kernel keeps each channel's state in registers and walks the timesteps
+// itself: one simdgroup per (batch, channel d), lane n owns state[d, n], and
+// `simd_sum` over the lanes gives y[t, d]. The state is carried in float32
+// (the graph path rounds it to the activation dtype every step), so results
+// are closer to an f32 reference but not byte-identical to the graph path.
+// The sequence length is read at run time from X_shape so one compiled kernel
+// serves every prompt length.
+namespace {
+    static const char* MAMBA1_SCAN_METAL_SOURCE = R"(
+        const uint lane = thread_position_in_threadgroup.x;
+        const uint d = thread_position_in_grid.y;
+        const uint b = thread_position_in_grid.z;
+        if (d >= Dm) {
+            return;
+        }
+        const int L = X_shape[1];
+        const bool active = lane < N;
+
+        float s = 0.0f;
+        float a = 0.0f;
+        if (active) {
+            s = static_cast<float>(state_in[(b * Dm + d) * N + lane]);
+            a = static_cast<float>(A[d * N + lane]);
+        }
+        const float dp = static_cast<float>(Dp[d]);
+
+        for (int t = 0; t < L; ++t) {
+            const size_t row = (size_t)b * L + t;
+            const float dt = static_cast<float>(DT[row * Dm + d]);
+            const float xv = static_cast<float>(X[row * Dm + d]);
+            float contrib = 0.0f;
+            if (active) {
+                const float bv = static_cast<float>(Bm[row * N + lane]);
+                const float cv = static_cast<float>(Cm[row * N + lane]);
+                s = metal::exp(dt * a) * s + dt * xv * bv;
+                contrib = s * cv;
+            }
+            const float y = simd_sum(contrib);
+            if (lane == 0) {
+                Y[row * Dm + d] = static_cast<T>(y + xv * dp);
+            }
+        }
+        if (active) {
+            state_out[(b * Dm + d) * N + lane] = s;
+        }
+    )";
+
+    struct Mamba1ScanKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!initialized) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "mamba1_selective_scan",
+                    {"X", "DT", "Bm", "Cm", "A", "Dp", "state_in"},
+                    {"Y", "state_out"},
+                    MAMBA1_SCAN_METAL_SOURCE
+                );
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static Mamba1ScanKernelHolder& get_mamba1_scan_kernel() {
+        static Mamba1ScanKernelHolder holder;
+        return holder;
+    }
+}
+
+bool mamba1_scan_kernel_available() {
+#ifdef __APPLE__
+    // MLXCEL_MAMBA1_SCAN_KERNEL=0 forces the graph scan (A/B, rollback).
+    if (const char* e = std::getenv("MLXCEL_MAMBA1_SCAN_KERNEL")) {
+        if (e[0] == '0' && e[1] == '\0') {
+            return false;
+        }
+    }
+    return mlx::core::metal::is_available();
+#else
+    return false;
+#endif
+}
+
+void mamba1_selective_scan(
+    const MlxArray& x,
+    const MlxArray& delta,
+    const MlxArray& b,
+    const MlxArray& c,
+    const MlxArray& a,
+    const MlxArray& d,
+    const MlxArray& state_in,
+    std::unique_ptr<MlxArray>& y,
+    std::unique_ptr<MlxArray>& state_out
+) {
+    using namespace mlx::core;
+
+    auto shape = x.inner.shape();
+    int batch = shape[0];
+    int seq = shape[1];
+    int dm = shape[2];
+    int n = b.inner.shape().back();
+    auto t = x.inner.dtype();
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
+        {"T", t},
+        {"N", n},
+        {"Dm", dm},
+    };
+    std::vector<array> inputs = {
+        x.inner,
+        astype(delta.inner, t),
+        astype(b.inner, t),
+        astype(c.inner, t),
+        astype(a.inner, float32),
+        astype(d.inner, t),
+        astype(state_in.inner, float32),
+    };
+    std::vector<Shape> output_shapes = {Shape{batch, seq, dm}, Shape{batch, dm, n}};
+    std::vector<Dtype> output_dtypes = {t, float32};
+    int rows_per_group = 8;
+    int grid_y = ((dm + rows_per_group - 1) / rows_per_group) * rows_per_group;
+
+    auto results = get_mamba1_scan_kernel().get()(
+        inputs,
+        output_shapes,
+        output_dtypes,
+        std::make_tuple(32, grid_y, batch),
+        std::make_tuple(32, rows_per_group, 1),
+        template_args,
+        std::nullopt,
+        false,
+        {}
+    );
+    y = std::make_unique<MlxArray>(std::move(results[0]));
+    state_out = std::make_unique<MlxArray>(std::move(results[1]));
+}
+
 // ── Fused MoE expert kernel (single-token decode, power-of-2 bits) ──────────
 // Computes a decode token's routed-expert output:
 //   out[h] = sum_k scores[k] * down_k( silu(gate_k(x)) * up_k(x) )[h]
