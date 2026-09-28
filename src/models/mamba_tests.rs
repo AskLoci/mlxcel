@@ -472,3 +472,108 @@ fn mamba_mixer_norm_is_identity_when_bcdt_rms_disabled() {
         "mixer_norm must pass x through unchanged when use_bcdt_rms is false"
     );
 }
+
+fn varied(
+    shape: &[i32],
+    seed: u64,
+    scale: f32,
+    offset: f32,
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let len: usize = shape.iter().map(|d| *d as usize).product();
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    let data: Vec<f32> = (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((state >> 40) as f32) / ((1u32 << 24) as f32) * 2.0 - 1.0) * scale + offset
+        })
+        .collect();
+    mlxcel_core::from_slice_f32(&data, shape)
+}
+
+/// A `MambaBlock` with seeded, position-dependent weights, so that a scan that
+/// dropped or reordered steps would change its output.
+fn varied_mamba_block(use_bcdt_rms: bool) -> super::MambaBlock {
+    use mlxcel_core::layers::{Linear, UnifiedLinear};
+    let (h, i, n, r, k) = (8usize, 16usize, 8usize, 4usize, 4usize);
+    let lin = |out: usize, inp: usize, seed: u64| {
+        UnifiedLinear::Regular(Linear::new(
+            varied(&[out as i32, inp as i32], seed, 0.4, 0.0),
+            None,
+        ))
+    };
+    super::MambaBlock {
+        hidden_size: h,
+        intermediate_size: i,
+        state_size: n,
+        conv_kernel_size: k,
+        time_step_rank: r,
+        use_bcdt_rms,
+        mixer_rms_eps: 1e-6,
+        conv_weight: varied(&[i as i32, k as i32, 1], 1, 0.5, 0.0),
+        conv_bias: Some(varied(&[i as i32], 2, 0.1, 0.0)),
+        in_proj: lin(2 * i, h, 3),
+        x_proj: lin(r + 2 * n, i, 4),
+        dt_proj: UnifiedLinear::Regular(Linear::new(
+            varied(&[i as i32, r as i32], 5, 0.4, 0.0),
+            Some(varied(&[i as i32], 6, 0.2, -0.5)),
+        )),
+        out_proj: lin(h, i, 7),
+        a_log: varied(&[i as i32, n as i32], 8, 0.5, 0.0),
+        d_param: varied(&[i as i32], 9, 1.0, 0.0),
+    }
+}
+
+fn rows(arr: &mlxcel_core::MlxArray) -> Vec<f32> {
+    let a = mlxcel_core::astype(arr, dtype::FLOAT32);
+    mlxcel_core::eval(&a);
+    mlxcel_core::array_to_raw_bytes(&a)
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Issue #2007: a multi-token forward through `MambaBlock` (the prefill path,
+/// which on Metal projects the whole sequence and runs the fused scan kernel)
+/// must give, row for row, what feeding the same inputs one token at a time
+/// gives, fresh and continuing from an existing conv and SSM state, with and
+/// without the Falcon-Mamba mixer norm.
+#[test]
+fn mamba_block_prefill_rows_match_token_by_token_forward() {
+    let h = 8usize;
+    for use_bcdt_rms in [false, true] {
+        for (warm, chunk) in [(0usize, 7usize), (3, 5)] {
+            let total = warm + chunk;
+            let x = varied(&[1, total as i32, h as i32], 20, 1.0, 0.0);
+            let block = varied_mamba_block(use_bcdt_rms);
+
+            let mut step_cache = super::MambaCache::new();
+            let want: Vec<Vec<f32>> = (0..total)
+                .map(|t| {
+                    let xt = slice_axis(&x, 1, t as i32, t as i32 + 1);
+                    rows(&block.forward(&xt, Some(&mut step_cache)))
+                })
+                .collect();
+
+            let mut cache = super::MambaCache::new();
+            if warm > 0 {
+                let xw = slice_axis(&x, 1, 0, warm as i32);
+                let _ = rows(&block.forward(&xw, Some(&mut cache)));
+            }
+            let xc = slice_axis(&x, 1, warm as i32, total as i32);
+            let got = rows(&block.forward(&xc, Some(&mut cache)));
+            assert_eq!(got.len(), chunk * h);
+            for row in 0..chunk {
+                let max = got[row * h..(row + 1) * h]
+                    .iter()
+                    .zip(&want[warm + row])
+                    .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+                assert!(
+                    max < 1e-4,
+                    "bcdt_rms {use_bcdt_rms} warm {warm} chunk {chunk} row {row}: max |diff| {max}"
+                );
+            }
+        }
+    }
+}

@@ -1811,7 +1811,7 @@ mod ffi {
         /// x, delta `[B, L, D]`, b, c `[B, L, N]`, a `[D, N]` (= -exp(A_log)),
         /// d `[D]`, state_in `[B, D, N]`. Writes y `[B, L, D]` in x's dtype and
         /// the final state `[B, D, N]` in float32.
-        /// Used by: Jamba
+        /// Used by: Jamba, Mamba, Falcon-Mamba
         #[allow(clippy::too_many_arguments)]
         fn mamba1_selective_scan(
             x: &MlxArray,
