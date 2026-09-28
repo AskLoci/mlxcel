@@ -1,0 +1,21 @@
+# actionlint configuration.
+#
+# Self-hosted runner labels cannot be discovered by a linter, so without this
+# list `actionlint` reports every `runs-on` naming one as an unknown label. On
+# this repository that was seven findings on `ci.yml` alone, which is enough
+# noise to make a lint job land red on arrival and be ignored or removed. These
+# are the labels the workflows actually target; adding a runner means adding it
+# here too (lablup/mlxcel#1992).
+self-hosted-runner:
+  labels:
+    # The single shared Linux GPU runner: CUDA jobs, clippy, the WebUI
+    # installed-artifact check, and the release build.
+    - GB10
+    # The AMD gfx1151 runner the ROCm gate waits for (lablup/mlxcel#1811).
+    - rocm-gfx1151
+    # Used as one element of a `[self-hosted, Linux, X64, CUDA]` label set.
+    - CUDA
+    # Apple Silicon runner with the macOS 26 SDK and Metal 4.
+    - self-hosted-macos-26-arm64
+    # The three-host pipeline-parallel rig in pipeline-parallel-ci.yml.
+    - pp-three-host

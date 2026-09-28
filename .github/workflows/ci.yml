@@ -110,6 +110,7 @@ jobs:
       xla_link: ${{ steps.filter.outputs.xla_link }}
       cuda_arch: ${{ steps.filter.outputs.cuda_arch }}
       rocm: ${{ steps.filter.outputs.rocm }}
+      workflows: ${{ steps.filter.outputs.workflows }}
       webui_bundle: ${{ steps.filter.outputs.webui_bundle }}
     steps:
       - uses: actions/checkout@v7
@@ -118,6 +119,15 @@ jobs:
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Required for the `!` patterns below to mean anything. Under the
+          # default `some`, a negated pattern is just another pattern to match,
+          # so `'src/lib/mlx-cpp/**'` plus `'!src/lib/mlx-cpp/patches-rocm/**'`
+          # still matches a ROCm-only change: the action's own README says the
+          # exclusion syntax is ignored "UNLESS you specify 'every' or
+          # 'some-with-excludes'". Safe to set globally because no filter here
+          # used negation before this change, and for a filter with no negated
+          # rule `some-with-excludes` reduces to `some` (lablup/mlxcel#1992).
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             rust:
               - '**/*.rs'
@@ -126,14 +136,12 @@ jobs:
               - 'deny.toml'
               - 'build.rs'
               - 'scripts/iree/**'
-              - '.github/workflows/ci.yml'
             mlx_pin:
               - 'src/lib/mlx-cpp/CMakeLists.txt'
               - 'src/lib/mlxcel-core/build_support/mlx_pin.rs'
               - 'src/lib/mlxcel-mlx-pin/**'
               - 'scripts/ci/mlx_pinned_commit.sh'
               - 'scripts/ci/mlx_pinned_commit_test.sh'
-              - '.github/workflows/ci.yml'
             # Narrower than `rust` above: only the paths that can move the IREE
             # link recipe itself, so the release link job below does not run on
             # every Rust PR. See the `xla-link` job comment for the rationale.
@@ -143,7 +151,6 @@ jobs:
               - 'src/lib/mlxcel-xla/csrc/**'
               - 'scripts/iree/**'
               - 'rust-toolchain.toml'
-              - '.github/workflows/ci.yml'
               # The CUDA half of the same link line: mlxcel-core's build
               # script names the CUDA libraries, and the MLX pin decides which
               # of them libmlx.a needs. See the `xla-link` job comment.
@@ -157,10 +164,23 @@ jobs:
             # `cuda-sm70-compile` job comment for why sm_70 specifically.
             cuda_arch:
               - 'src/lib/mlx-cpp/**'
+              # Two subtrees under that glob cannot change what nvcc compiles,
+              # and these are the heaviest jobs on the shared GB10 runner. Most
+              # of epic #1801's pull requests touch only `patches-rocm/`, so
+              # before this exclusion every one of them woke both CUDA jobs
+              # (lablup/mlxcel#1992).
+              #
+              # Note what is NOT excluded: `patches/` as a whole. Despite the
+              # name it is not the Metal overlay. `patches/mlx/backend/cuda/`
+              # holds 24 CUDA sources, applied and compiled for CUDA targets by
+              # `src/lib/mlx-cpp/CMakeLists.txt:59-69`, against 4 Metal files in
+              # `patches/mlx/backend/metal/`. Excluding `patches/**` would drop
+              # real CUDA coverage, so only the Metal subtree is named.
+              - '!src/lib/mlx-cpp/patches-rocm/**'
+              - '!src/lib/mlx-cpp/patches/mlx/backend/metal/**'
               - 'src/lib/mlxcel-core/build.rs'
               - 'src/lib/mlxcel-core/build_support/**'
               - 'build.rs'
-              - '.github/workflows/ci.yml'
             # Everything that can change what the ROCm build compiles, links or
             # runs: the HIP overlay, the shared MLX build inputs, the bridge
             # sources the overlay is called through, and the pinned MLX commit.
@@ -168,13 +188,26 @@ jobs:
             # now lives in `patches-rocm/` and nothing else in CI links it.
             rocm:
               - 'src/lib/mlx-cpp/**'
+              # The mirror of the exclusion above: neither the Metal files nor
+              # the CUDA overlays reach a HIP compile. `patches/` is split by
+              # subtree here for the same reason it is there, that the directory
+              # holds both backends' files.
+              - '!src/lib/mlx-cpp/patches/mlx/backend/metal/**'
+              - '!src/lib/mlx-cpp/patches/mlx/backend/cuda/**'
+              - '!src/lib/mlx-cpp/patches-cuda/**'
               - 'src/lib/mlxcel-core/build.rs'
               - 'src/lib/mlxcel-core/build_support/**'
               - 'src/lib/mlxcel-core/cpp/**'
               - 'build.rs'
               - '**/Cargo.toml'
               - 'Cargo.lock'
-              - '.github/workflows/ci.yml'
+            # The workflow files themselves. Deliberately NOT folded into the
+            # filters above: those gate what gets compiled, and a workflow edit
+            # compiles nothing. What a workflow edit needs is the lint job and
+            # the advisory below, both hosted.
+            workflows:
+              - '.github/workflows/**'
+              - '.github/actionlint.yaml'
             webui_bundle:
               - 'webui/**'
               - 'src/webui/assets/**'
@@ -188,7 +221,6 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'Makefile'
-              - '.github/workflows/ci.yml'
 
   deny:
     name: cargo-deny
@@ -237,7 +269,9 @@ jobs:
     # runner's own user. What actually gates that case is the repository's
     # Actions fork-PR approval policy, currently `first_time_contributors`.
     # The same reading applies to `xla-compile` and `xla-link` below.
-    if: github.repository == 'lablup/mlxcel' && needs.changes.outputs.rust == 'true'
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && (needs.changes.outputs.rust == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
@@ -566,7 +600,11 @@ jobs:
   webui-installed-artifact:
     name: WebUI installed artifact
     needs: changes
-    if: github.repository == 'lablup/mlxcel' && (needs.changes.outputs.webui_bundle == 'true' || needs.changes.outputs.rust == 'true')
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && (needs.changes.outputs.webui_bundle == 'true'
+          || needs.changes.outputs.rust == 'true'
+          || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
@@ -941,7 +979,9 @@ jobs:
   xla-compile:
     name: OpenXLA feature compile
     needs: changes
-    if: github.repository == 'lablup/mlxcel' && needs.changes.outputs.rust == 'true'
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && (needs.changes.outputs.rust == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
@@ -1112,7 +1152,9 @@ jobs:
   xla-link:
     name: OpenXLA feature link
     needs: changes
-    if: github.repository == 'lablup/mlxcel' && needs.changes.outputs.xla_link == 'true'
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && (needs.changes.outputs.xla_link == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
@@ -1203,7 +1245,9 @@ jobs:
   cuda-sm70-compile:
     name: CUDA sm_70 compile
     needs: changes
-    if: github.repository == 'lablup/mlxcel' && needs.changes.outputs.cuda_arch == 'true'
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && (needs.changes.outputs.cuda_arch == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
@@ -1359,7 +1403,9 @@ jobs:
   cuda-blockfloat:
     name: CUDA block-float converter
     needs: changes
-    if: github.repository == 'lablup/mlxcel' && needs.changes.outputs.cuda_arch == 'true'
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && (needs.changes.outputs.cuda_arch == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
     runs-on: GB10
     permissions:
       contents: read
@@ -1565,7 +1611,7 @@ jobs:
     # `rocm-runner-status` below says which state it is in.
     if: >-
       github.repository == 'lablup/mlxcel'
-      && needs.changes.outputs.rocm == 'true'
+      && (needs.changes.outputs.rocm == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
       && vars.ROCM_CI_ENABLED == 'true'
     runs-on: [self-hosted, rocm-gfx1151]
     permissions:
@@ -1739,3 +1785,93 @@ jobs:
           echo "::warning title=ROCm gate parked::This PR changes paths that affect the ROCm build, but 'ROCm build and generate' did not run: vars.ROCM_CI_ENABLED is not 'true'. Register a runner labelled rocm-gfx1151 and set that repository variable to 'true' to activate it (lablup/mlxcel#1811)."
           echo "ROCm gate parked: vars.ROCM_CI_ENABLED is not 'true'."
           echo "To activate: register a self-hosted runner labelled rocm-gfx1151, then set the repository variable ROCM_CI_ENABLED to 'true'."
+
+  # ============================================================================
+  # Workflow lint (hosted)
+  # ============================================================================
+  # Every path filter used to list `.github/workflows/ci.yml`, so a workflow
+  # edit re-ran the heavy self-hosted jobs. The stated reason was to validate a
+  # CI change before merge, but it was aimed at the wrong failure.
+  #
+  # Workflow changes break in two ways. A schema or expression error makes
+  # GitHub reject the whole file and run nothing, so re-running heavy jobs
+  # catches nothing: the run just reports "This run likely failed because of a
+  # workflow file issue." That is not hypothetical, it happened on #1989 from a
+  # single invalid `permissions` key. And an error in a job's own script, which
+  # only running that job can catch, and which the `ci:full` label now opts
+  # into deliberately.
+  #
+  # This job covers the first class properly, in seconds, on a hosted runner.
+  # `actionlint` rejects the exact key that broke #1989 by name. The repository
+  # is clean against it, which took a `.github/actionlint.yaml` listing the
+  # self-hosted runner labels: without that, seven `runner-label` findings would
+  # have made this job red on arrival and therefore worthless.
+  workflow-lint:
+    name: workflow lint
+    needs: changes
+    if: github.repository == 'lablup/mlxcel' && needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run actionlint
+        env:
+          # Pinned. A floating version can add a check and turn this red on a
+          # PR that changed nothing about workflows, which is how a lint job
+          # stops being trusted.
+          ACTIONLINT_VERSION: 1.7.7
+        run: |
+          curl -sSLo actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          tar xzf actionlint.tar.gz actionlint
+          ./actionlint -version
+          # Severity floor, not a suppression. The hosted image ships a shell
+          # linter, so actionlint also checks every `run:` block, and this
+          # repository carries 21 info and 4 warning findings there that predate
+          # the job (mostly SC2086 quoting and SC2016 single-quoted
+          # expressions). Landing red on all of them would make the job
+          # something to ignore or delete. Errors are what break a script, and
+          # at this floor the job is still load-bearing: the only two
+          # error-level findings when it was written were its own, from a
+          # comment line whose first word was read as a linter directive.
+          # Clearing the info and warning backlog is separate work.
+          #
+          # Do not start a comment line in any `run:` block with that linter's
+          # name; it is parsed as a directive and reports SC1072/SC1073.
+          ./actionlint -shellcheck='shellcheck --severity=error'
+
+  # ============================================================================
+  # Self-hosted gate advisory (hosted)
+  # ============================================================================
+  # The jobs on the shared runners no longer re-run when a workflow file
+  # changes. That is the point, but left silent it would be its own trap: a PR
+  # that rewrites the script inside `cuda-sm70-compile` would show no CUDA check
+  # at all, and a reviewer could reasonably read that as "it passed".
+  #
+  # So say it. Advisory only, never failing, because failing would put the cost
+  # back: a documentation PR that happens to touch a workflow comment would be
+  # blocked until someone ran the heavy jobs it cannot affect. Whoever does want
+  # them run adds the `ci:full` label, which every self-hosted job now honours.
+  self-hosted-gate-advisory:
+    name: self-hosted gate advisory
+    needs: changes
+    if: >-
+      github.repository == 'lablup/mlxcel'
+      && github.event_name == 'pull_request'
+      && needs.changes.outputs.workflows == 'true'
+      && !contains(github.event.pull_request.labels.*.name, 'ci:full')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - name: Note that the self-hosted jobs were not re-run for this workflow change
+        run: |
+          echo "::warning title=Self-hosted jobs not re-run::This PR changes .github/workflows/**, which no longer re-runs the jobs on the shared GB10 and gfx1151 runners (lablup/mlxcel#1992). They run when the paths they actually gate change. If this PR edits the script inside one of those jobs, add the 'ci:full' label to run them and validate it before merge."
+          echo "Self-hosted jobs were gated on the paths they cover, not on this workflow change."
+          echo "Add the 'ci:full' label to force them."
