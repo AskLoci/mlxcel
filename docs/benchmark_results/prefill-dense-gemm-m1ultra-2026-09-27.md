@@ -80,6 +80,7 @@ No model regresses at 1024 rows or more, so the M1 gate and the 1024-row
 threshold stand for both dtypes. Greedy output with the path off and on is
 identical on all seven with a prompt above 1024 tokens.
 
+## Correctness
 
 - f16 scales: teacher-forced logit traces (1024 tokens × 2, top-8, six
   decimals) are byte-identical files with the path on and off for Llama 3.1 8B
