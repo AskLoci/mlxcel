@@ -134,6 +134,37 @@ fn gpu_backend() -> bool {
     sampling_rejection_available()
 }
 
+/// The kernel entry point with its refusal unwrapped.
+///
+/// Every call below sits behind `gpu_backend()`, which is the same support
+/// predicate the launcher refuses on (issue #1885). An `Err` here therefore
+/// means the gate and the launcher disagree, which is a defect worth failing
+/// loudly for rather than a backend this test should have skipped.
+fn fused_sample_rejection_ok(
+    logits: &MlxArray,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    max_rounds: i32,
+) -> UniquePtr<MlxArray> {
+    fused_sample_rejection(logits, temperature, top_k, top_p, min_p, max_rounds)
+        .expect("gpu_backend() reported a rejection port, so the launcher must not refuse")
+}
+
+/// The deferred variant, same contract as `fused_sample_rejection_ok`.
+fn fused_sample_rejection_deferred_ok(
+    logits: &MlxArray,
+    temperature: f32,
+    top_k: i32,
+    top_p: f32,
+    min_p: f32,
+    max_rounds: i32,
+) -> UniquePtr<MlxArray> {
+    fused_sample_rejection_deferred(logits, temperature, top_k, top_p, min_p, max_rounds)
+        .expect("gpu_backend() reported a rejection port, so the launcher must not refuse")
+}
+
 // -- numeric helpers (same construction as `sampling_gumbel_tests.rs`) --
 
 /// Wilson-Hilferty upper critical value of the chi-square distribution.
@@ -910,7 +941,7 @@ fn a_starved_round_cap_falls_back_and_the_event_is_counted() {
 
     reset_sampling_dispatch();
     assert_eq!(rejection_cap_overflow_rows(), 0);
-    let tokens = u32_values(&fused_sample_rejection(&batched, 1.0, 40, 1.0, 0.0, 1));
+    let tokens = u32_values(&fused_sample_rejection_ok(&batched, 1.0, 40, 1.0, 0.0, 1));
     assert_eq!(tokens.len(), rows);
     assert!(
         tokens.iter().all(|&id| (id as usize) < vocab),
@@ -1015,7 +1046,7 @@ fn took_the_kernel(batched: &MlxArray, top_k: i32, top_p: f32, min_p: f32) -> bo
     random_seed(0x0901_0F0F);
     let routed = u32_values(&fused_sample(batched, 1.0, top_k, top_p, min_p));
     random_seed(0x0901_0F0F);
-    let kernel = u32_values(&fused_sample_rejection(
+    let kernel = u32_values(&fused_sample_rejection_ok(
         batched, 1.0, top_k, top_p, min_p, cap,
     ));
     random_seed(0x0901_0F0F);
@@ -1154,7 +1185,7 @@ fn the_reference_arm_stays_on_the_argpartition_chain() {
     random_seed(0x0901_ABCD);
     let chain = u32_values(&fused_sample_categorical(&batched, 1.0, 40, 0.9, 0.0));
     random_seed(0x0901_ABCD);
-    let kernel = u32_values(&fused_sample_rejection(&batched, 1.0, 40, 0.9, 0.0, 32));
+    let kernel = u32_values(&fused_sample_rejection_ok(&batched, 1.0, 40, 0.9, 0.0, 32));
     assert_ne!(
         chain, kernel,
         "the reference arm produced the rejection kernel's stream; the A/B is measuring one path"
@@ -1291,7 +1322,7 @@ fn the_forced_entry_point_is_the_one_that_synchronizes() {
     let cap = sampling_rejection_max_rounds();
 
     let (build, drain) = build_and_drain(24, || {
-        fused_sample_rejection(&batched, 1.0, 0, 0.9, 0.0, cap)
+        fused_sample_rejection_ok(&batched, 1.0, 0, 0.9, 0.0, cap)
     });
     assert!(
         build > drain,
@@ -1339,7 +1370,7 @@ fn cap_overflow_is_detected_without_waiting_on_the_production_path() {
     // immediately under the target, so a one-round cap converges and there is
     // nothing to count. Requiring the draw to land in the top forty of 152064
     // entries is what makes one round hopeless.
-    let ids = u32_values(&fused_sample_rejection_deferred(
+    let ids = u32_values(&fused_sample_rejection_deferred_ok(
         &batched, 1.0, 40, 0.9, 0.0, 1,
     ));
     assert_eq!(ids.len(), rows);

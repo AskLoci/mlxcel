@@ -81,17 +81,38 @@ fn falsy_env_restores_the_categorical_sampling_path() {
         "kill switch set, but fused_sample did not reproduce the categorical path"
     );
 
-    // ... and it must NOT be the kernel, which the same seed would reproduce
-    // exactly if the gate were inert.
+    // The kernel entry point is reached directly here, which is a different
+    // question from routing. On a backend with a port it must still work, and
+    // on one without it must refuse with a named error rather than fall into
+    // the Metal arm and abort the process (issue #1885). Both arms are
+    // asserted: skipping the second would leave the refusal itself untested,
+    // and it is the whole point of the fix.
     random_seed(0x0900_00FF);
-    let gumbel = token_ids(&gumbel_max_sample(&batched, 1.0));
-    assert_ne!(
-        through_fused, gumbel,
-        "kill switch set, but fused_sample still produced the Gumbel-max stream"
-    );
-
-    // The kernel entry point itself stays callable: the switch gates routing,
-    // not the kernel, so an explicit caller and the benchmark still work.
-    assert_eq!(gumbel.len(), rows);
-    assert!(gumbel.iter().all(|&id| (id as usize) < vocab));
+    match gumbel_max_sample(&batched, 1.0) {
+        Ok(array) => {
+            let gumbel = token_ids(&array);
+            // ... and it must NOT be the kernel, which the same seed would
+            // reproduce exactly if the gate were inert.
+            assert_ne!(
+                through_fused, gumbel,
+                "kill switch set, but fused_sample still produced the Gumbel-max stream"
+            );
+            // The kernel entry point itself stays callable: the switch gates
+            // routing, not the kernel, so an explicit caller and the benchmark
+            // still work.
+            assert_eq!(gumbel.len(), rows);
+            assert!(gumbel.iter().all(|&id| (id as usize) < vocab));
+        }
+        Err(error) => {
+            assert!(
+                !mlxcel_core::custom_kernels_available(),
+                "the launcher refused on a backend that reports a kernel port: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("gumbel_max_sample") && message.contains("no custom kernel port"),
+                "the refusal must name the entry point and the missing port: {message}"
+            );
+        }
+    }
 }

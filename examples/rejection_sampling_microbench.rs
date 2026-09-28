@@ -105,12 +105,12 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use mlxcel_core::{
-    MlxArray, UniquePtr, array_to_raw_bytes, async_eval_pair, eval, from_slice_f32, fused_sample,
-    fused_sample_categorical, fused_sample_rejection, gpu_backend_available, matmul, random_seed,
-    rejection_cap_overflow_launches, rejection_cap_overflow_rows, reset_sampling_dispatch,
-    sampling_dispatch_drain_pending, sampling_dispatch_recorded_report,
-    sampling_rejection_available, sampling_rejection_max_rounds, sampling_rejection_probe,
-    sampling_rejection_routes, synchronize_default,
+    MlxArray, UniquePtr, array_to_raw_bytes, async_eval_pair, custom_kernels_available, eval,
+    from_slice_f32, fused_sample, fused_sample_categorical, fused_sample_rejection,
+    gpu_backend_available, matmul, random_seed, rejection_cap_overflow_launches,
+    rejection_cap_overflow_rows, reset_sampling_dispatch, sampling_dispatch_drain_pending,
+    sampling_dispatch_recorded_report, sampling_rejection_available, sampling_rejection_max_rounds,
+    sampling_rejection_probe, sampling_rejection_routes, synchronize_default,
 };
 
 /// Target duration for the synthetic forward in the pipelined mode. Roughly a
@@ -350,6 +350,17 @@ fn main() {
         eprintln!("No GPU backend available; the sampling kernel cannot run here.");
         return;
     }
+    // A GPU is not enough: this benchmark calls the kernel entry point directly,
+    // and that refuses on a backend with no port (issue #1885). The gate is the
+    // port predicate alone, deliberately not `sampling_rejection_available()`,
+    // because the whole point of the isolated arm is to measure the kernel with
+    // routing switched off, and that predicate folds in the routing kill switch.
+    if !custom_kernels_available() {
+        eprintln!(
+            "This GPU backend has no rejection-sampling kernel port; there is nothing to measure."
+        );
+        return;
+    }
     let cap = sampling_rejection_max_rounds();
     println!(
         "Dual-pivot rejection sampling microbenchmark (#901)  iters={} warmup={}  \
@@ -365,7 +376,8 @@ fn main() {
     let _ = fused_sample_categorical(&probe_logits, TEMPERATURE, 40, 0.9, 0.0);
     print_dispatch("  baseline arm  -> ");
     reset_sampling_dispatch();
-    let _ = fused_sample_rejection(&probe_logits, TEMPERATURE, 40, 0.9, 0.0, cap);
+    let _ = fused_sample_rejection(&probe_logits, TEMPERATURE, 40, 0.9, 0.0, cap)
+        .expect("the port gate above passed, so the launcher must not refuse");
     print_dispatch("  rejection arm (iso)  -> ");
     reset_sampling_dispatch();
     let _ = fused_sample(&probe_logits, TEMPERATURE, 0, 0.9, 0.0);
@@ -423,6 +435,7 @@ fn main() {
                 random_seed(0x0901_BEEF);
                 let iso_rej = time_arm(&logits, &opts, |x| {
                     fused_sample_rejection(x, TEMPERATURE, top_k, top_p, min_p, cap)
+                        .expect("the port gate in main() passed, so the launcher must not refuse")
                 });
                 random_seed(0x0901_BEEF);
                 let pipe_base = time_arm_pipelined(&logits, &opts, &forward, |x| {

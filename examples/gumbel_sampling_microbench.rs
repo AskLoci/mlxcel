@@ -63,9 +63,9 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use mlxcel_core::{
-    MlxArray, UniquePtr, eval, from_slice_f32, fused_sample_categorical, gpu_backend_available,
-    gumbel_max_sample, gumbel_sample_num_splits, random_seed, sampling_gumbel_available,
-    synchronize_default,
+    MlxArray, UniquePtr, custom_kernels_available, eval, from_slice_f32, fused_sample_categorical,
+    gpu_backend_available, gumbel_max_sample, gumbel_sample_num_splits, random_seed,
+    sampling_gumbel_available, synchronize_default,
 };
 
 const VOCABS: [i32; 3] = [32_768, 65_536, 152_064];
@@ -163,6 +163,15 @@ fn main() {
         eprintln!("No GPU backend available; the sampling kernel cannot run here.");
         return;
     }
+    // A GPU is not enough: this benchmark calls the kernel entry point directly,
+    // and that refuses on a backend with no port (issue #1885). Gated on the
+    // port predicate alone rather than `sampling_gumbel_available()`, which
+    // folds in the routing kill switch this benchmark deliberately measures
+    // against.
+    if !custom_kernels_available() {
+        eprintln!("This GPU backend has no Gumbel-max kernel port; there is nothing to measure.");
+        return;
+    }
     println!(
         "Gumbel-max sampling microbenchmark (#900)  iters={} warmup={}  \
          routing_enabled={}",
@@ -188,7 +197,10 @@ fn main() {
                 fused_sample_categorical(x, TEMPERATURE, 0, 1.0, 0.0)
             });
             random_seed(0x0900_BEEF);
-            let gumbel = time_arm(&logits, &opts, |x| gumbel_max_sample(x, TEMPERATURE));
+            let gumbel = time_arm(&logits, &opts, |x| {
+                gumbel_max_sample(x, TEMPERATURE)
+                    .expect("the port gate in main() passed, so the launcher must not refuse")
+            });
 
             let baseline_us = baseline.as_secs_f64() * 1e6;
             let gumbel_us = gumbel.as_secs_f64() * 1e6;

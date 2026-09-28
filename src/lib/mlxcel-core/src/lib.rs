@@ -2320,7 +2320,13 @@ mod ffi {
         /// uint32 token-id array drawn from `softmax(logits / temperature)`.
         /// Requires `temperature > 0` and a backend for which
         /// [`sampling_gumbel_available`] reports support.
-        fn gumbel_max_sample(logits: &MlxArray, temperature: f32) -> UniquePtr<MlxArray>;
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the process
+        /// on a C++ throw across a `noexcept` extern (issue #1885). Production
+        /// never sees that `Err`: it gates on the support predicate above and
+        /// takes the graph fallback. A direct caller gets a named error.
+        fn gumbel_max_sample(logits: &MlxArray, temperature: f32) -> Result<UniquePtr<MlxArray>>;
 
         /// True when [`fused_sample`]'s no-filter stochastic path takes the
         /// Gumbel-max kernel: the backend supports it (GPU default device with
@@ -2337,6 +2343,12 @@ mod ffi {
         /// forced. Bypasses the `MLXCEL_SAMPLING_REJECTION` gate and takes an
         /// explicit round cap so a test can drive the cap-overflow fallback.
         /// Returns `[batch]` uint32 token ids.
+        ///
+        /// `Result` because the launcher refuses on a backend with no kernel
+        /// port rather than falling into the Metal arm and aborting the process
+        /// on a C++ throw across a `noexcept` extern (issue #1885). Production
+        /// never sees that `Err`: it gates on the support predicate above and
+        /// takes the graph fallback. A direct caller gets a named error.
         fn fused_sample_rejection(
             logits: &MlxArray,
             temperature: f32,
@@ -2344,13 +2356,14 @@ mod ffi {
             top_p: f32,
             min_p: f32,
             max_rounds: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// The production rejection launch with an explicit round cap (#901),
         /// landed and checked in place. Shares the overflow counting rule with
         /// the deferred drain, so a test can pin that rule and its report
         /// without depending on the best-effort ring that delivers the flags in
-        /// production.
+        /// production. Shares the guarded launcher with
+        /// [`fused_sample_rejection`], so it is `Result` for the same reason.
         fn fused_sample_rejection_deferred(
             logits: &MlxArray,
             temperature: f32,
@@ -2358,7 +2371,7 @@ mod ffi {
             top_p: f32,
             min_p: f32,
             max_rounds: i32,
-        ) -> UniquePtr<MlxArray>;
+        ) -> Result<UniquePtr<MlxArray>>;
 
         /// Raw rejection kernel outputs stacked as `[3, batch]` uint32: row 0
         /// sampled ids, row 1 the per-row converged flag, row 2 rounds

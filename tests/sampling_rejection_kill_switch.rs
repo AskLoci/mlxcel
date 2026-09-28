@@ -106,16 +106,45 @@ fn falsy_env_restores_the_argpartition_filter_chain() {
     reset_sampling_dispatch();
     let _ = token_ids(&fused_sample(&batched, 1.0, 40, 0.9, 0.0));
     let lines = recorded();
+    // Which decline gets reported depends on the backend, and only one of the
+    // two can be true at a time. A backend with no kernel port declines for
+    // that reason before the kill switch is ever consulted, so asserting the
+    // kill-switch text there would be asserting something that cannot happen
+    // (issue #1885). Both arms are checked rather than skipping one.
+    let expected = if mlxcel_core::custom_kernels_available() {
+        "MLXCEL_SAMPLING_REJECTION"
+    } else {
+        "no rejection-sampling kernel port"
+    };
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("MLXCEL_SAMPLING_REJECTION")),
-        "the kill switch decline was not reported: {lines:?}"
+        lines.iter().any(|l| l.contains(expected)),
+        "the decline was not reported as {expected:?}: {lines:?}"
     );
 
-    // The kernel entry point itself stays callable: the switch gates routing,
-    // not the kernel, so an explicit caller and the benchmark still work.
-    let forced = token_ids(&fused_sample_rejection(&batched, 1.0, 40, 0.9, 0.0, 32));
-    assert_eq!(forced.len(), rows);
-    assert!(forced.iter().all(|&id| (id as usize) < vocab));
+    // The kernel entry point is reached directly here, which is a different
+    // question from routing. See the twin assertion in
+    // `sampling_gumbel_kill_switch.rs` for why both arms are checked rather
+    // than skipping the refusal (issue #1885).
+    match fused_sample_rejection(&batched, 1.0, 40, 0.9, 0.0, 32) {
+        Ok(array) => {
+            // The kernel entry point itself stays callable: the switch gates
+            // routing, not the kernel, so an explicit caller and the benchmark
+            // still work.
+            let forced = token_ids(&array);
+            assert_eq!(forced.len(), rows);
+            assert!(forced.iter().all(|&id| (id as usize) < vocab));
+        }
+        Err(error) => {
+            assert!(
+                !mlxcel_core::custom_kernels_available(),
+                "the launcher refused on a backend that reports a kernel port: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("fused_sample_rejection")
+                    && message.contains("no custom kernel port"),
+                "the refusal must name the entry point and the missing port: {message}"
+            );
+        }
+    }
 }

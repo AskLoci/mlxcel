@@ -6312,8 +6312,12 @@ static std::unique_ptr<MlxArray> fused_sample_impl(
                     kind == SAMPLING_DISPATCH_KILL_SWITCH
                         ? "argpartition chain: pinned by "
                           "MLXCEL_SAMPLING_REJECTION"
-                        : "argpartition chain: no Metal or CUDA GPU backend "
-                          "for the rejection kernel");
+                        // Not "no GPU backend": on ROCm there is one, it
+                        // just has no port for this kernel, and saying the
+                        // former sends a reader hunting for a missing device
+                        // (issue #1885).
+                        : "argpartition chain: this GPU backend has no "
+                          "rejection-sampling kernel port");
             }
         } else if (!mlxcel::turbo::rejection_sample_accepts(x)) {
             if (sampling_dispatch_is_new(SAMPLING_DISPATCH_SHAPE_UNSUPPORTED)) {

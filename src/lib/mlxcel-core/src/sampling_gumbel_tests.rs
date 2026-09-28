@@ -84,6 +84,17 @@ fn gpu_backend() -> bool {
     sampling_gumbel_available()
 }
 
+/// The kernel entry point with its refusal unwrapped.
+///
+/// Every call below sits behind `gpu_backend()`, which is the same support
+/// predicate the launcher refuses on (issue #1885). An `Err` here therefore
+/// means the gate and the launcher disagree, which is a defect worth failing
+/// loudly for rather than a backend this test should have skipped.
+fn gumbel_max_sample_ok(logits: &MlxArray, temperature: f32) -> UniquePtr<MlxArray> {
+    gumbel_max_sample(logits, temperature)
+        .expect("gpu_backend() reported a Gumbel-max port, so the launcher must not refuse")
+}
+
 /// Wilson-Hilferty upper critical value of the chi-square distribution.
 ///
 /// `(chi2 / df)^(1/3)` is approximately normal with mean `1 - 2/(9 df)` and
@@ -142,7 +153,7 @@ fn histogram(logits: &[f32], temperature: f32, n: usize) -> Vec<u64> {
     let mut counts = vec![0u64; vocab];
     let mut drawn = 0usize;
     while drawn < n {
-        let tokens = gumbel_max_sample(&batched, temperature);
+        let tokens = gumbel_max_sample_ok(&batched, temperature);
         for id in token_ids(&tokens) {
             if drawn >= n {
                 break;
@@ -450,7 +461,7 @@ fn gumbel_sample_is_reproducible_for_a_fixed_seed() {
         random_seed(0x5EED_0900);
         let mut stream = Vec::new();
         for _ in 0..8 {
-            stream.extend(token_ids(&gumbel_max_sample(&batched, 1.0)));
+            stream.extend(token_ids(&gumbel_max_sample_ok(&batched, 1.0)));
         }
         stream
     };
@@ -490,9 +501,9 @@ fn gumbel_sample_index_does_not_depend_on_the_launch_split() {
     let batch = from_slice_f32(&tiled, &[128, vocab as i32]);
 
     random_seed(0xC0FFEE);
-    let from_single = token_ids(&gumbel_max_sample(&single, 1.0));
+    let from_single = token_ids(&gumbel_max_sample_ok(&single, 1.0));
     random_seed(0xC0FFEE);
-    let from_batch = token_ids(&gumbel_max_sample(&batch, 1.0));
+    let from_batch = token_ids(&gumbel_max_sample_ok(&batch, 1.0));
 
     assert_eq!(
         from_single[0], from_batch[0],
@@ -518,7 +529,7 @@ fn fused_sample_routes_the_no_filter_path_to_the_gumbel_kernel() {
     random_seed(0xA11CE);
     let routed = token_ids(&fused_sample(&batched, 1.0, 0, 1.0, 0.0));
     random_seed(0xA11CE);
-    let direct = token_ids(&gumbel_max_sample(&batched, 1.0));
+    let direct = token_ids(&gumbel_max_sample_ok(&batched, 1.0));
     assert_eq!(
         routed, direct,
         "fused_sample did not take the Gumbel-max path with no filter set"
@@ -572,7 +583,7 @@ fn filtered_configs_never_reach_the_gumbel_kernel() {
         random_seed(0xBEEF);
         let through_fused = token_ids(&fused_sample(&batched, 1.0, top_k, top_p, min_p));
         random_seed(0xBEEF);
-        let unfiltered = token_ids(&gumbel_max_sample(&batched, 1.0));
+        let unfiltered = token_ids(&gumbel_max_sample_ok(&batched, 1.0));
         assert_ne!(
             through_fused, unfiltered,
             "top_k={top_k} top_p={top_p} min_p={min_p} produced the unfiltered \

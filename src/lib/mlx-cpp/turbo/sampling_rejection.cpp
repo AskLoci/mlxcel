@@ -773,10 +773,17 @@ RejectionSampleResult rejection_sample(
     const int batch = probs_filter.shape(0);
     const int rounds = max_rounds > 0 ? max_rounds : 1;
 
-    // Metal kernel on Apple, CUDA port elsewhere. `mx.fast.metal_kernel` throws
-    // "[metal_kernel] No Metal back-end" on the CUDA backend, so dispatch the
-    // `cuda_kernel` port there; both share the template args, grid, and buffer
-    // contract.
+    // Refuse before selecting a port; see the twin guard in `sampling.cpp` for
+    // why the message is phrased against the backend rather than the port
+    // (issues #1803, #1885).
+    if (!mlxcel::custom_kernels_available()) {
+      throw std::runtime_error(
+          "[fused_sample_rejection] no custom kernel port for this GPU backend; "
+          "mlxcel's callers take the argpartition fallback instead");
+    }
+
+    // Two ports exist, Metal and CUDA, and the backend picks between them. Both
+    // share the template args, grid, and buffer contract.
     const bool use_cuda =
         mlxcel::gpu_kernel_backend() == mlxcel::GpuKernelBackend::Cuda;
     auto& kernel = use_cuda ? get_rejection_kernel_cuda().get()
