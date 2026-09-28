@@ -6,6 +6,25 @@
 # ============================================================================
 
 CARGO := cargo
+
+# Cargo parallelism for the ROCm targets below, as a whole flag so that
+# `ROCM_JOBS=` disables the cap.
+#
+# The cap exists because the gfx1151 validation host has 32 cores against 30 GiB
+# of RAM *shared with the GPU services it also runs*. Measured there on
+# 2026-09-28: three `llama-server` processes held 25.5 GiB, leaving about 2 GiB
+# for a build, and cargo's default of one rustc per core cannot fit in that. The
+# failure is an OOM kill partway through compiling, which reads as an unrelated
+# crash rather than as memory pressure.
+#
+# So the right value depends on what else is resident, not on the core count:
+# check that first. `-j 6` is what has built this workspace here when the GPU
+# services are idle, and is not enough when they are not. Measured with them
+# stopped, a full `verify-rocm` at this value never dropped below 14.8 GiB
+# available, so the cap is conservative on an otherwise free machine and the
+# co-tenants really were the constraint. `verify-rocm-smoke` reports available
+# memory before it starts for that reason.
+ROCM_JOBS ?= -j 6
 RUSTFLAGS := RUSTFLAGS="-C target-cpu=native"
 WEBUI_CONTRACT_PY ?= python3
 WEBUI_BUNDLE_PY ?= python3
@@ -760,7 +779,30 @@ verify-test-cuda: ## CUDA gate: cargo test --workspace --profile test-fast --fea
 .PHONY: verify-test-rocm
 verify-test-rocm: ## ROCm gate (experimental): cargo test --workspace --profile test-fast --features rocm --no-fail-fast -- --test-threads=1 (issue #1809)
 	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=rocm, single threaded)...$(RESET)"
-	$(CARGO) test --workspace --profile test-fast --features rocm --no-fail-fast -- --test-threads=1
+	$(CARGO) test --workspace --profile test-fast $(ROCM_JOBS) --features rocm --no-fail-fast -- --test-threads=1
+
+.PHONY: verify-clippy-rocm
+verify-clippy-rocm: ## ROCm lint: clippy --workspace --all-targets --features rocm -- -D warnings
+	@echo "$(CYAN)[verify] clippy (workspace, all targets, features=rocm)...$(RESET)"
+	$(CARGO) clippy --workspace --all-targets $(ROCM_JOBS) --features rocm -- -D warnings
+
+.PHONY: verify-rocm-smoke
+verify-rocm-smoke: ## ROCm smoke: build, link and generate on the GPU, asserting the device and the output (issue #1811)
+	@echo "$(CYAN)[verify] rocm smoke (build, link, generate)...$(RESET)"
+	@bash scripts/ci/rocm_smoke.sh
+
+# Order matters here, and not in the usual cheap-first way. `verify-rocm-smoke`
+# runs BEFORE `verify-test-rocm` because make stops at the first failing
+# prerequisite, and the ROCm test gate currently has known failures (the nvfp4
+# abort of #1806 and the sampler aborts of #1885). With the test gate first the
+# smoke was never reached at all, which was measured rather than reasoned: the
+# first full run of this target ended without the smoke having executed once.
+# The smoke is also the fastest high-signal part, so a developer gets the
+# "does a real forward pass still run on this device" answer even while the
+# suite is red.
+.PHONY: verify-rocm
+verify-rocm: verify-versions verify-kernel-dtype-keys verify-llama-compat verify-fmt verify-clippy-rocm verify-rocm-smoke verify-test-rocm ## Run the ROCm gate locally on an AMD host (issue #1811)
+	@echo "$(GREEN)[verify-rocm] OK$(RESET)"
 
 .PHONY: verify-versions
 verify-versions: ## Assert every version-tracking workspace crate carries the root `mlxcel` version
