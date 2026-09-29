@@ -29,6 +29,7 @@
 mod attention;
 pub mod config;
 pub mod encoder;
+pub(crate) mod f32_weights;
 pub mod fastconformer;
 pub mod feature_extractor;
 pub(crate) mod fft;
@@ -44,6 +45,7 @@ pub mod phi4mm;
 pub mod preprocessing;
 pub mod qwen3_omni_moe;
 pub mod rnnt;
+pub(crate) mod stage_probe;
 pub mod wav_writer;
 pub mod whisper_mel;
 
