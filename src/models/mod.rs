@@ -200,6 +200,7 @@ pub mod muse_glimmer;
 pub(crate) mod muse_glimmer_cache;
 pub mod muse_glimmer_config;
 pub(crate) mod muse_glimmer_layers;
+pub mod nanochat;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
@@ -351,6 +352,7 @@ pub use muse_glimmer::{
     DEFAULT_IMAGE_TOKEN_ID, MuseGlimmerConfig, MuseGlimmerTextConfig, MuseGlimmerTextModel,
     MuseGlimmerTextWrapper, MuseGlimmerVisionConfig,
 };
+pub use nanochat::NanoChatModel;
 pub use nemotron::NemotronModel;
 pub use nemotron_h::NemotronHModel;
 pub use nemotron_nas::NemotronNASModel;
@@ -600,6 +602,7 @@ pub enum ModelType {
     Gpt2,       // GPT-2 (learned absolute position embeddings, Conv1D weight layout)
     GptBigCode, // GPT-BigCode (StarCoder / SantaCoder: GPT-2 block with multi-query attention)
     GptNeoX,    // GPT-NeoX (EleutherAI Pythia: interleaved per-head QKV, partial RoPE)
+    NanoChat,   // nanochat (weightless RMSNorm, relu^2 MLP, mirrored RoPE, softcapped logits)
 
     // Code models
     StarCoder2,
@@ -849,6 +852,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Gpt2,
     ModelType::GptBigCode,
     ModelType::GptNeoX,
+    ModelType::NanoChat,
     // Code models
     ModelType::StarCoder2,
     ModelType::Mellum,
@@ -1198,6 +1202,10 @@ impl ModelType {
                 "GPT-2 (learned absolute positions, Conv1D weights)",
                 "Specialized",
             ),
+            ModelType::NanoChat => (
+                "nanochat (weightless RMSNorm, relu^2 MLP, softcapped logits)",
+                "Specialized",
+            ),
             ModelType::GptBigCode => (
                 "GPT-BigCode (StarCoder / SantaCoder, multi-query attention)",
                 "Specialized",
@@ -1480,6 +1488,7 @@ mod metadata_tests {
             Gpt2,
             GptBigCode,
             GptNeoX,
+            NanoChat,
             StarCoder2,
             Mellum,
             Laguna,
