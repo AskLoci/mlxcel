@@ -29,16 +29,21 @@
 mod attention;
 pub mod config;
 pub mod encoder;
+pub mod fastconformer;
 pub mod feature_extractor;
 pub(crate) mod fft;
 pub mod gemma3n;
 pub mod inkling_dmel;
 pub mod inkling_processor;
 pub mod inkling_tower;
+pub(crate) mod native_reduce;
+pub mod nemotron_codec;
 pub mod nemotron_h_nano_omni;
+pub mod nemotron_mel;
 pub mod phi4mm;
 pub mod preprocessing;
 pub mod qwen3_omni_moe;
+pub mod rnnt;
 pub mod wav_writer;
 pub mod whisper_mel;
 
