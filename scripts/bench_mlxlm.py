@@ -76,7 +76,93 @@ CSV_HEADER = (
 )
 
 
-def detect_hardware():
+def _read_first_line(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.readline().strip()
+    except OSError:
+        return ""
+
+
+def detect_rocm_gpu():
+    """The AMD GPU this host would run MLX's ROCm backend on, or None.
+
+    Returns a dict with `gfx`, `name`, `rocm_version` and `vram_bytes`, built
+    from the same sources scripts/bench_decode.sh falls back to (`rocminfo`'s
+    first GPU agent, the ROCm `.info/version` file, and the kernel's
+    `mem_info_vram_total`), so that both harnesses tag one host the same way
+    and `scripts/compare_bench_csv.py` can pair their files (issue #1810).
+    """
+    # bench_decode.sh checks for an NVIDIA GPU first; do the same so a host
+    # with both vendors gets one label from both harnesses.
+    if shutil.which("nvidia-smi"):
+        try:
+            if subprocess.run(["nvidia-smi"], capture_output=True, timeout=60).returncode == 0:
+                return None
+        except (OSError, subprocess.SubprocessError):
+            pass
+    root = os.environ.get("ROCM_PATH", "/opt/rocm")
+    rocminfo = shutil.which("rocminfo") or os.path.join(root, "bin", "rocminfo")
+    if not os.access(rocminfo, os.X_OK):
+        return None
+    try:
+        out = subprocess.run([rocminfo], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    name = market = ""
+    gfx = None
+    for line in out.splitlines():
+        if line.startswith("Agent "):
+            name = market = ""
+        elif line.startswith("  Name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("  Marketing Name:"):
+            market = line.split(":", 1)[1].strip()
+        elif line.startswith("  Device Type:") and line.split(":", 1)[1].strip() == "GPU":
+            if name.startswith("gfx"):
+                gfx = name
+                break
+    if gfx is None:
+        return None
+    version = _read_first_line(os.path.join(root, ".info", "version"))
+    if not version:
+        for path in sorted(Path(root).glob("core*/.info/version")):
+            version = _read_first_line(path)
+            if version:
+                break
+    vram = 0
+    for path in sorted(Path("/sys/class/drm").glob("card*/device/mem_info_vram_total")):
+        text = _read_first_line(path)
+        if text.isdigit() and int(text) > 0:
+            vram = int(text)
+            break
+    return {"gfx": gfx, "name": market or "AMD_GPU", "rocm_version": version, "vram_bytes": vram}
+
+
+def _host_memory_bytes():
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def rocm_hardware_names(gpu):
+    """(short, full) tags for an AMD GPU, identical to bench_decode.sh's."""
+    full = f"{gpu['name']}_{gpu['gfx']}"
+    if gpu["rocm_version"]:
+        full += f"_ROCm{gpu['rocm_version']}"
+    # Device memory, as bench_decode.sh records it; host memory when the
+    # device reports none, which is also that script's fallback.
+    mem = gpu["vram_bytes"] or _host_memory_bytes()
+    full += f"_{mem / 1073741824:.0f}GB" if mem else "_"
+    full = full.replace(" ", "_")
+    short = "strixhalo-gfx1151" if gpu["gfx"] == "gfx1151" else f"amd-{gpu['gfx']}"
+    return short, full
+
+
+def detect_hardware(rocm_gpu=None):
+    if rocm_gpu is not None:
+        return rocm_hardware_names(rocm_gpu)
     try:
         chip = subprocess.run(
             ["sysctl", "-n", "machdep.cpu.brand_string"],
@@ -427,8 +513,14 @@ def main():
     ap.add_argument("--suffix", default="", help="Optional CSV filename suffix")
     args = ap.parse_args()
 
-    hw_short, hw_full = detect_hardware()
+    rocm_gpu = detect_rocm_gpu() if sys.platform.startswith("linux") else None
+    hw_short, hw_full = detect_hardware(rocm_gpu)
     today = date.today().isoformat()
+    # On a ROCm APU the GPU's budget is its carve-out, not the 128 GB Apple
+    # default above; an explicit PYLM_BENCH_MAX_GB still wins.
+    global MEMORY_LIMIT_BYTES
+    if rocm_gpu and rocm_gpu["vram_bytes"] and not _env_max_gb:
+        MEMORY_LIMIT_BYTES = int(rocm_gpu["vram_bytes"] * 0.85)
     # Get versions
     # Ask the interpreter that actually runs the benchmark, not the one running
     # this script. They differ whenever PYTHON_CMD resolves to the uv venv,
@@ -443,6 +535,17 @@ def main():
         )
         ver = probe.stdout.strip().splitlines()[-1] if probe.returncode == 0 else ""
         mlx_version = f"{label}-{ver}" if ver else "unknown"
+        # A ROCm baseline runs on a source build of MLX, not a release wheel,
+        # so the MLX build (its version carries the source commit) is part of
+        # what the row measured. Apple rows keep the historical value.
+        if rocm_gpu and ver:
+            core = subprocess.run(
+                [*PYTHON_CMD, "-c", "import mlx.core as mx; print(mx.__version__)"],
+                capture_output=True, text=True, timeout=120,
+            )
+            core_ver = core.stdout.strip().splitlines()[-1] if core.returncode == 0 and core.stdout.strip() else ""
+            if core_ver:
+                mlx_version = f"{mlx_version}+mlx-{core_ver}"
     except Exception:
         mlx_version = "unknown"
 
