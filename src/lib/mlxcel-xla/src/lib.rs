@@ -69,6 +69,7 @@ mod prepared_deepstack;
 mod prepared_gemma3n;
 
 #[cfg(feature = "iree")]
+#[path = "auxiliary.rs"]
 mod aux;
 #[cfg(feature = "iree")]
 mod aux_manifest;
