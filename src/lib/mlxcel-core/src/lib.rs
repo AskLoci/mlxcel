@@ -1414,8 +1414,9 @@ mod ffi {
         /// Returns `Err` instead of ending the process when the GPU backend has
         /// no custom kernel port (issue #1803): the C++ launcher throws and cxx
         /// turns that into an `Err` here, which a `noexcept` extern could not
-        /// do. mlxcel's own callers gate on `custom_kernels_available()` and
-        /// never reach it.
+        /// do. mlxcel's own callers gate on
+        /// [`paged_attention_decode_available`] (or the all-kernels
+        /// [`paged_attention_kernels_available`]) and never reach it.
         fn paged_attention_decode(
             q: &MlxArray,
             k_pool: &MlxArray,
@@ -1477,8 +1478,8 @@ mod ffi {
         /// Returns `Err` instead of ending the process when the GPU backend has
         /// no custom kernel port (issue #1803): the C++ launcher throws and cxx
         /// turns that into an `Err` here, which a `noexcept` extern could not
-        /// do. mlxcel's own callers gate on `custom_kernels_available()` and
-        /// never reach it.
+        /// do. mlxcel's own callers gate on [`paged_attention_merge_available`]
+        /// or [`paged_attention_kernels_available`] and never reach it.
         fn paged_attention_merge_states(
             v_in: &MlxArray,
             lse_in: &MlxArray,
@@ -1486,6 +1487,32 @@ mod ffi {
             v_out: &mut UniquePtr<MlxArray>,
             lse_out: &mut UniquePtr<MlxArray>,
         ) -> Result<()>;
+
+        /// True when the resolved GPU backend has ports of all three
+        /// paged-attention kernels: the v1 decode kernel, the v2 partial kernel
+        /// and the merge kernel. Answered from the kernels' own `KernelPorts`
+        /// tables (`has_kernel_port`), the ones their launchers dispatch
+        /// through, so this cannot say yes to a launch that would refuse.
+        /// Metal and CUDA today; ROCm answers `false` until lablup/mlxcel#1814
+        /// ports them.
+        fn paged_attention_kernels_available() -> bool;
+
+        /// True when the resolved GPU backend has a port of the merge kernel
+        /// ([`paged_attention_merge_states`]), which MLA split-KV uses on its
+        /// own. Same source of truth as [`paged_attention_kernels_available`].
+        fn paged_attention_merge_available() -> bool;
+
+        /// True when the resolved GPU backend has a port of the v1 paged
+        /// decode kernel ([`paged_attention_decode`]). Same source of truth as
+        /// [`paged_attention_kernels_available`].
+        fn paged_attention_decode_available() -> bool;
+
+        /// True when the resolved GPU backend has ports of both v2 kernels,
+        /// the partial kernel ([`paged_attention_decode_v2_partial`]) and the
+        /// merge kernel, which the flat, cascade and sparse v2 launches use
+        /// together. Same source of truth as
+        /// [`paged_attention_kernels_available`].
+        fn paged_attention_v2_available() -> bool;
 
         /// Query heads one v2 CTA processes together (issue #898). Always
         /// divides `n_rep`, so the plan's CTA count and the launcher's grid

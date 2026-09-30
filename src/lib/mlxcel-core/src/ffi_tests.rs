@@ -671,6 +671,7 @@ fn test_pooled_paged_decode_matches_dense_over_200_steps() {
 /// exercises its block-table indexing rather than a contiguous run.
 #[test]
 fn test_fused_paged_decode_matches_gather_over_200_steps() {
+    crate::test_support::kernel_ports::require_paged_decode_port!();
     use crate::cache::{PagedBlockPool, PagedSequenceState};
 
     const STEPS: usize = 200;
@@ -809,10 +810,14 @@ fn test_fused_paged_decode_matches_gather_over_200_steps() {
 fn test_fused_paged_decode_gqa_and_batched() {
     use crate::cache::{PagedBlockPool, PagedSequenceState};
 
-    // The fused paged-decode kernel dispatches a Metal JIT body on Apple and a
-    // CUDA JIT body on NVIDIA (#634); on a CPU-only build neither backend can
-    // launch it, so skip there rather than aborting the process.
-    if !crate::metal_is_available() && !crate::cuda_is_available() {
+    // The fused paged-decode kernel has a Metal JIT body and a CUDA JIT body
+    // (#634) and no HIP port yet (#1814). ROCm skips visibly through the shared
+    // helper, which reads the kernel's port table, so a HIP port runs this
+    // test. A build with no GPU backend cannot launch it and skips here; on
+    // Metal and CUDA the test always runs, so a wrongly false predicate there
+    // fails it instead of passing.
+    crate::test_support::kernel_ports::require_paged_decode_port!();
+    if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::None {
         return;
     }
 
@@ -916,9 +921,10 @@ fn test_fused_paged_decode_gqa_and_batched() {
 fn test_fused_paged_decode_native_vs_fallback_matrix() {
     use crate::cache::{PagedBlockPool, PagedSequenceState};
 
-    if !crate::metal_is_available() && !crate::cuda_is_available() {
-        // No GPU backend can launch the fused kernel; the CPU build has no
-        // native path to compare (it always gathers). Nothing to verify.
+    crate::test_support::kernel_ports::require_paged_decode_port!();
+    if crate::hardware::gpu_backend_kind() == crate::hardware::GpuBackendKind::None {
+        // No GPU backend (a CPU-only build): the native path cannot run, so
+        // there is nothing to compare.
         return;
     }
 
