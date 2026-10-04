@@ -411,9 +411,19 @@ fn load_qwen3_5_vlm_with_variant(
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     models::qwen3_5::validate_qwen35_wrapper_config(&full_config)?;
 
+    let image_config =
+        vision::processors::qwen2_vl::QwenImageProcessorConfig::from_model_path(model_path)?;
+
     let mut vision_config: Qwen3VLVisionConfig =
         parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3.5 vision config")?;
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
+
+    let processor =
+        qwen_vl_processor_with_norm(model_path, &vision_config, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])?;
+    let processor = match image_config {
+        Some(config) => processor.with_image_config(config)?,
+        None => processor,
+    };
 
     let raw_weights = load_vlm_weights_common(model_path, None)?;
     let mut text_weights = mlxcel_core::weights::WeightMap::new();
@@ -485,8 +495,6 @@ fn load_qwen3_5_vlm_with_variant(
         Qwen3VLVisionEncoder::from_weights(&vision_weights, &vision_config, "vision_tower")
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3.5 vision encoder: {}", e))?;
 
-    let processor =
-        qwen_vl_processor_with_norm(model_path, &vision_config, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5])?;
     let token_ids = qwen35_vl_token_ids(&full_config, text_config.vocab_size)?;
 
     let vlm = vision::Qwen35VLModel {

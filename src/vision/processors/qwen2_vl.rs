@@ -27,6 +27,11 @@ use image::DynamicImage;
 use image::imageops::FilterType;
 use mlxcel_core::{MlxArray, UniquePtr};
 
+mod fast_bicubic;
+mod image_config;
+
+pub use image_config::{QwenImageError, QwenImageProcessorConfig};
+
 pub struct Qwen2VLProcessor {
     pub patch_size: usize,
     pub temporal_patch_size: usize,
@@ -38,6 +43,7 @@ pub struct Qwen2VLProcessor {
     pub video_default_fps: f64,
     pub video_min_frames: usize,
     pub video_max_frames: usize,
+    image_config: Option<QwenImageProcessorConfig>,
 }
 
 /// Default lower pixel bound the Qwen2-VL processors are constructed with.
@@ -140,6 +146,47 @@ pub enum Qwen2VLMediaInput<'a> {
     Video(&'a [DynamicImage]),
 }
 
+struct MediaPlan<'a> {
+    frames: Vec<&'a DynamicImage>,
+    width: u32,
+    height: u32,
+    grid: (i32, i32, i32),
+    image: bool,
+}
+
+fn tensor_shape(
+    grids: &[(i32, i32, i32)],
+    patch_size: usize,
+    temporal: usize,
+) -> Result<([i32; 2], usize), QwenImageError> {
+    let features = patch_size
+        .checked_mul(patch_size)
+        .and_then(|value| value.checked_mul(3))
+        .filter(|value| *value > 0)
+        .ok_or(QwenImageError::Capacity)?;
+    let rows = grids
+        .iter()
+        .try_fold(0_usize, |rows, &(time, height, width)| {
+            let count =
+                [time, height, width]
+                    .into_iter()
+                    .try_fold(temporal, |count, dimension| {
+                        usize::try_from(dimension)
+                            .ok()
+                            .filter(|value| *value > 0)
+                            .and_then(|dimension| count.checked_mul(dimension))
+                    })?;
+            rows.checked_add(count)
+        })
+        .ok_or(QwenImageError::Capacity)?;
+    let values = rows.checked_mul(features).ok_or(QwenImageError::Capacity)?;
+    let shape = [
+        i32::try_from(rows).map_err(|_| QwenImageError::Capacity)?,
+        i32::try_from(features).map_err(|_| QwenImageError::Capacity)?,
+    ];
+    Ok((shape, values))
+}
+
 /// Largest visual token count one image can expand into under these bounds.
 ///
 /// `smart_resize` rounds both edges to `patch_size * spatial_merge_size` and
@@ -164,6 +211,78 @@ pub fn max_image_tokens(
 }
 
 impl Qwen2VLProcessor {
+    fn media_plan<'a>(&self, item: Qwen2VLMediaInput<'a>) -> Result<MediaPlan<'a>, String> {
+        let (frames, height, width, temporal, image) = match item {
+            Qwen2VLMediaInput::Image(image) => {
+                let (height, width) = if let Some(config) = &self.image_config {
+                    image_config::validate_image(image).map_err(|error| error.to_string())?;
+                    let (width, height) = config
+                        .image_dimensions(image.width(), image.height())
+                        .map_err(|error| error.to_string())?;
+                    (height, width)
+                } else {
+                    self.smart_resize(image.height(), image.width())
+                };
+                (
+                    std::iter::repeat_n(image, self.temporal_patch_size).collect(),
+                    height,
+                    width,
+                    1,
+                    true,
+                )
+            }
+            Qwen2VLMediaInput::Video(frames) => {
+                let frames = self.pad_video_frames(frames)?;
+                let first = frames
+                    .first()
+                    .ok_or_else(|| "Qwen-VL video contains no decoded frames".to_owned())?;
+                let (height, width) = self.smart_resize(first.height(), first.width());
+                let temporal = frames.len() / self.temporal_patch_size;
+                (frames, height, width, temporal, false)
+            }
+        };
+        let convert =
+            |value| i32::try_from(value).map_err(|_| QwenImageError::Capacity.to_string());
+        let grid = (
+            convert(temporal)?,
+            convert(height as usize / self.patch_size)?,
+            convert(width as usize / self.patch_size)?,
+        );
+        Ok(MediaPlan {
+            frames,
+            width,
+            height,
+            grid,
+            image,
+        })
+    }
+
+    fn media_plans<'a>(
+        &self,
+        media: &[Qwen2VLMediaInput<'a>],
+    ) -> Result<Vec<MediaPlan<'a>>, String> {
+        if let Some(config) = &self.image_config {
+            self.validate_image_config(config)
+                .map_err(|error| error.to_string())?;
+            let mut budget = image_config::ImageBatchBudget::default();
+            for item in media {
+                if let Qwen2VLMediaInput::Image(image) = item {
+                    budget
+                        .push(config, image.width(), image.height())
+                        .map_err(|error| error.to_string())?;
+                    image_config::validate_image(image).map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(media.len())
+            .map_err(|_| QwenImageError::Capacity.to_string())?;
+        for item in media {
+            plans.push(self.media_plan(*item)?);
+        }
+        Ok(plans)
+    }
     /// Used by: Qwen2-VL, Qwen2.5-VL (CLIP normalization)
     pub fn new(patch_size: usize, temporal_patch_size: usize, spatial_merge_size: usize) -> Self {
         crate::vision::image_token_overrides::note_dynamic_resolution_processor();
@@ -178,6 +297,7 @@ impl Qwen2VLProcessor {
             video_default_fps: DEFAULT_VIDEO_FPS,
             video_min_frames: DEFAULT_VIDEO_MIN_FRAMES,
             video_max_frames: DEFAULT_VIDEO_MAX_FRAMES,
+            image_config: None,
         }
     }
 
@@ -201,6 +321,7 @@ impl Qwen2VLProcessor {
             video_default_fps: DEFAULT_VIDEO_FPS,
             video_min_frames: DEFAULT_VIDEO_MIN_FRAMES,
             video_max_frames: DEFAULT_VIDEO_MAX_FRAMES,
+            image_config: None,
         }
     }
 
@@ -210,6 +331,41 @@ impl Qwen2VLProcessor {
         self.video_min_frames = config.min_frames;
         self.video_max_frames = config.max_frames;
         self
+    }
+
+    pub fn with_image_config(
+        mut self,
+        config: QwenImageProcessorConfig,
+    ) -> Result<Self, QwenImageError> {
+        self.validate_image_config(&config)?;
+        self.image_config = Some(config);
+        Ok(self)
+    }
+
+    pub fn image_config(&self) -> Option<&QwenImageProcessorConfig> {
+        self.image_config.as_ref()
+    }
+
+    fn validate_image_config(
+        &self,
+        config: &QwenImageProcessorConfig,
+    ) -> Result<(), QwenImageError> {
+        if self.patch_size != config.patch_size as usize
+            || self.temporal_patch_size != config.temporal_patch_size as usize
+            || self.spatial_merge_size != config.merge_size as usize
+        {
+            return Err(QwenImageError::Configuration);
+        }
+        Ok(())
+    }
+
+    pub fn image_grid(&self, width: u32, height: u32) -> Result<(i32, i32, i32), QwenImageError> {
+        let config = self
+            .image_config
+            .as_ref()
+            .ok_or(QwenImageError::Configuration)?;
+        self.validate_image_config(config)?;
+        config.image_grid(width, height)
     }
 
     #[must_use]
@@ -339,39 +495,33 @@ impl Qwen2VLProcessor {
         &self,
         media: &[Qwen2VLMediaInput<'_>],
     ) -> Result<(Vec<f32>, Vec<(i32, i32, i32)>), String> {
+        let plans = self.media_plans(media)?;
+        let grid_thw: Vec<_> = plans.iter().map(|plan| plan.grid).collect();
+        let (_, capacity) = tensor_shape(&grid_thw, self.patch_size, self.temporal_patch_size)
+            .map_err(|error| error.to_string())?;
         let mut all_patches: Vec<f32> = Vec::new();
-        let mut grid_thw: Vec<(i32, i32, i32)> = Vec::with_capacity(media.len());
+        all_patches
+            .try_reserve_exact(capacity)
+            .map_err(|_| QwenImageError::Capacity.to_string())?;
         let in_channels = 3usize;
-        let patch_area = self.patch_size * self.patch_size;
-        let features_per_pixel = in_channels * patch_area;
 
-        for item in media {
-            let (frames, target_h, target_w, grid_t) = match *item {
-                Qwen2VLMediaInput::Image(image) => {
-                    let (h, w) = self.smart_resize(image.height(), image.width());
-                    let frames =
-                        std::iter::repeat_n(image, self.temporal_patch_size).collect::<Vec<_>>();
-                    (frames, h, w, 1usize)
-                }
-                Qwen2VLMediaInput::Video(frames) => {
-                    let frames = self.pad_video_frames(frames)?;
-                    let Some(first) = frames.first() else {
-                        return Err("Qwen-VL video contains no decoded frames".to_string());
-                    };
-                    let (h, w) = self.smart_resize(first.height(), first.width());
-                    let grid_t = frames.len() / self.temporal_patch_size;
-                    (frames, h, w, grid_t)
-                }
-            };
-
-            let h_patches = target_h as usize / self.patch_size;
-            let w_patches = target_w as usize / self.patch_size;
-            grid_thw.push((grid_t as i32, h_patches as i32, w_patches as i32));
-
-            let normalized_frames = frames
+        for plan in plans {
+            let (target_h, target_w) = (plan.height, plan.width);
+            let (grid_t, h_patches, w_patches) = (
+                plan.grid.0 as usize,
+                plan.grid.1 as usize,
+                plan.grid.2 as usize,
+            );
+            let normalized_frames = plan
+                .frames
                 .iter()
-                .map(|frame| self.normalize_resized_frame(frame, target_h, target_w))
-                .collect::<Vec<_>>();
+                .map(|frame| match (&self.image_config, plan.image) {
+                    (Some(config), true) => config
+                        .normalize(frame, target_w, target_h)
+                        .map_err(|error| error.to_string()),
+                    _ => Ok(self.normalize_resized_frame(frame, target_h, target_w)),
+                })
+                .collect::<Result<Vec<_>, String>>()?;
 
             for temporal_group in 0..grid_t {
                 for block_y in 0..h_patches / self.spatial_merge_size {
@@ -408,19 +558,9 @@ impl Qwen2VLProcessor {
             }
         }
 
-        debug_assert_eq!(
-            all_patches.len(),
-            grid_thw
-                .iter()
-                .map(|&(t, h, w)| {
-                    t as usize
-                        * h as usize
-                        * w as usize
-                        * self.temporal_patch_size
-                        * features_per_pixel
-                })
-                .sum::<usize>()
-        );
+        if all_patches.len() != capacity {
+            return Err(QwenImageError::Capacity.to_string());
+        }
         Ok((all_patches, grid_thw))
     }
 
@@ -429,17 +569,12 @@ impl Qwen2VLProcessor {
         media: &[Qwen2VLMediaInput<'_>],
     ) -> Result<(UniquePtr<MlxArray>, Vec<(i32, i32, i32)>), String> {
         let (all_patches, grid_thw) = self.preprocess_media_values_with_grid(media)?;
-        let in_channels = 3usize;
-        let patch_area = self.patch_size * self.patch_size;
-        let features_per_pixel = in_channels * patch_area;
-        let total_rows: usize = grid_thw
-            .iter()
-            .map(|&(t, h, w)| (t as usize) * (h as usize) * (w as usize) * self.temporal_patch_size)
-            .sum();
-        let pixel_values = mlxcel_core::from_slice_f32(
-            &all_patches,
-            &[total_rows as i32, features_per_pixel as i32],
-        );
+        let (shape, capacity) = tensor_shape(&grid_thw, self.patch_size, self.temporal_patch_size)
+            .map_err(|error| error.to_string())?;
+        if all_patches.len() != capacity {
+            return Err(QwenImageError::Capacity.to_string());
+        }
+        let pixel_values = mlxcel_core::from_slice_f32(&all_patches, &shape);
         Ok((pixel_values, grid_thw))
     }
 
@@ -509,6 +644,193 @@ impl ImageProcessor for Qwen2VLProcessor {
     fn preprocess(&self, images: &[image::DynamicImage]) -> UniquePtr<MlxArray> {
         let (pixel_values, _) = self.preprocess_with_grid(images);
         pixel_values
+    }
+}
+
+#[cfg(test)]
+mod configured_image_tests {
+    use super::{
+        Qwen2VLMediaInput, Qwen2VLProcessor, QwenImageError, QwenImageProcessorConfig, tensor_shape,
+    };
+    use image::{DynamicImage, Rgb, RgbImage};
+    use serde_json::json;
+
+    fn profile() -> Result<QwenImageProcessorConfig, QwenImageError> {
+        QwenImageProcessorConfig::from_processor_config(&json!({
+            "image_processor_type":"Qwen2VLImageProcessorFast", "patch_size":1,
+            "temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],
+            "image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4,"longest_edge":64}
+        }))
+    }
+
+    fn base() -> Qwen2VLProcessor {
+        let mut processor = Qwen2VLProcessor::new_with_norm(1, 2, 2, [0.5; 3], [0.5; 3]);
+        processor.min_pixels = 4;
+        processor.max_pixels = 64;
+        processor
+    }
+
+    #[test]
+    fn configured_images_keep_media_patch_temporal_and_channel_order() -> Result<(), String> {
+        let processor = base()
+            .with_image_config(profile().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let first = DynamicImage::ImageRgb8(RgbImage::from_fn(4, 4, |x, y| {
+            Rgb([(y * 4 + x) as u8, 64, 255])
+        }));
+        let second = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([255, 0, 128])));
+        let (values, grids) = processor.preprocess_media_values_with_grid(&[
+            Qwen2VLMediaInput::Image(&first),
+            Qwen2VLMediaInput::Image(&second),
+        ])?;
+        assert_eq!(grids, [(1, 4, 4), (1, 2, 2)]);
+        assert_eq!(values.len(), (16 + 4) * 2 * 3);
+        for (patch, red) in [0_u8, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15]
+            .iter()
+            .enumerate()
+        {
+            let expected = [
+                (f32::from(*red) - 127.5) / 127.5,
+                (64.0 - 127.5) / 127.5,
+                1.0,
+            ];
+            assert_eq!(&values[patch * 6..patch * 6 + 3], &expected);
+            assert_eq!(&values[patch * 6 + 3..patch * 6 + 6], &expected);
+        }
+        assert_eq!(&values[96..99], &[1.0, -1.0, (128.0 - 127.5) / 127.5]);
+        assert_eq!(
+            processor
+                .image_grid(first.width(), first.height())
+                .map_err(|error| error.to_string())?,
+            grids[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn image_profile_does_not_change_video_values_or_legacy_defaults() -> Result<(), String> {
+        let legacy = base();
+        let configured = base()
+            .with_image_config(profile().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let frames = vec![
+            DynamicImage::ImageRgb8(RgbImage::from_fn(3, 4, |x, y| {
+                Rgb([(x * 70) as u8, (y * 40) as u8, 128])
+            }));
+            4
+        ];
+        let media = [Qwen2VLMediaInput::Video(&frames)];
+        assert_eq!(
+            legacy.preprocess_media_values_with_grid(&media)?,
+            configured.preprocess_media_values_with_grid(&media)?
+        );
+        assert_eq!(legacy.smart_resize(4, 3), (4, 4));
+        assert!(legacy.image_config.is_none());
+        assert_eq!(
+            legacy.video_sampling_policy(),
+            configured.video_sampling_policy()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_inputs_and_mutated_geometry_fail_before_pixel_work() -> Result<(), String> {
+        let profile = profile().map_err(|error| error.to_string())?;
+        assert!(matches!(
+            Qwen2VLProcessor::new(14, 2, 2).with_image_config(profile.clone()),
+            Err(QwenImageError::Configuration)
+        ));
+        let mut processor = base()
+            .with_image_config(profile)
+            .map_err(|error| error.to_string())?;
+        for image in [
+            DynamicImage::new_rgb8(0, 1),
+            DynamicImage::new_rgb8(201, 1),
+            DynamicImage::new_rgb16(2, 2),
+        ] {
+            assert!(
+                processor
+                    .preprocess_media_values_with_grid(&[Qwen2VLMediaInput::Image(&image)])
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            processor.image_grid(u32::MAX, u32::MAX),
+            Err(QwenImageError::Geometry)
+        );
+        assert!(
+            processor
+                .preprocess_media_values_with_grid(&[Qwen2VLMediaInput::Video(&[])])
+                .is_err()
+        );
+        processor.patch_size = usize::MAX;
+        assert_eq!(
+            processor.image_grid(2, 2),
+            Err(QwenImageError::Configuration)
+        );
+        assert!(
+            processor
+                .preprocess_media_values_with_grid(&[Qwen2VLMediaInput::Image(
+                    &DynamicImage::new_rgb8(2, 2)
+                )])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_accessor_preserves_exact_installed_configuration() -> Result<(), QwenImageError> {
+        let expected = profile()?;
+        assert_eq!(base().image_config(), None);
+        let installed = base().with_image_config(expected.clone())?;
+        assert_eq!(installed.image_config(), Some(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn image_batch_rejects_excess_count_before_preprocessing() -> Result<(), String> {
+        let processor = base()
+            .with_image_config(profile().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let image = DynamicImage::new_rgb8(2, 2);
+        let images = [Qwen2VLMediaInput::Image(&image); 8];
+        assert_eq!(processor.media_plans(&images)?.len(), 8);
+        assert!(
+            processor
+                .media_plans(&[Qwen2VLMediaInput::Image(&image); 9])
+                .is_err()
+        );
+        assert!(
+            processor
+                .preprocess_media_values_with_grid(&[Qwen2VLMediaInput::Image(&image); 9])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_boundary_checks_cumulative_rows_and_feature_products() -> Result<(), QwenImageError> {
+        assert_eq!(
+            tensor_shape(&[(1, 2, 2), (2, 2, 2)], 16, 2)?,
+            ([24, 768], 18432)
+        );
+        assert_eq!(
+            tensor_shape(&[(1, i32::MAX / 2, 1); 2], 1, 2),
+            Err(QwenImageError::Capacity)
+        );
+        assert_eq!(
+            tensor_shape(&[(i32::MAX, i32::MAX, i32::MAX)], 1, 16),
+            Err(QwenImageError::Capacity)
+        );
+        assert_eq!(
+            tensor_shape(&[(1, 1, 1)], usize::MAX, 2),
+            Err(QwenImageError::Capacity)
+        );
+        assert_eq!(
+            tensor_shape(&[(1, 0, 1)], 16, 2),
+            Err(QwenImageError::Capacity)
+        );
+        Ok(())
     }
 }
 
