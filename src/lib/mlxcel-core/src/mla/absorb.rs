@@ -87,7 +87,12 @@ impl MlaAbsorbedProjections {
                 }
                 ffi::copy(&linear.weight)
             }
-            UnifiedLinear::Quantized { weight, bias } => {
+            UnifiedLinear::Quantized {
+                mobile: Some(_), ..
+            } => {
+                return Err("mla: Gemma mobile activation rounding cannot be absorbed".to_owned());
+            }
+            UnifiedLinear::Quantized { weight, bias, .. } => {
                 if bias.is_some() {
                     return Err(
                         "mla: kv_b_proj carries a bias, which the absorption identity does not \

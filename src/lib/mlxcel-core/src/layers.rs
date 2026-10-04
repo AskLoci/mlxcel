@@ -27,6 +27,9 @@ use cxx::UniquePtr;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+#[path = "gemma_mobile.rs"]
+pub mod gemma_mobile;
+
 pub use crate::cache::{ChunkedKVCache, KVCache, KVCacheMode, RotatingKVCache};
 
 /// Quantized weight structure for 4-bit/8-bit quantized layers
@@ -296,6 +299,8 @@ impl QuantizedEmbedding {
         bits: i32,
         mode: &str,
     ) -> Result<Self, String> {
+        let (group_size, bits) = gemma_mobile::parameters(weights, prefix, group_size, bits, mode)
+            .map_err(|error| format!("{error}: {prefix}"))?;
         let weight_name = format!("{}.weight", prefix);
         let scales_name = format!("{}.scales", prefix);
         let biases_name = format!("{}.biases", prefix);
@@ -1912,6 +1917,7 @@ pub enum UnifiedLinear {
     Quantized {
         weight: QuantizedWeight,
         bias: Option<UniquePtr<MlxArray>>,
+        mobile: Option<gemma_mobile::Activation>,
     },
     Regular(Linear),
 }
@@ -1922,7 +1928,11 @@ pub type QuantizedLinear = UnifiedLinear;
 impl UnifiedLinear {
     /// Create a new quantized linear layer (explicit construction)
     pub fn new(weight: QuantizedWeight, bias: Option<UniquePtr<MlxArray>>) -> Self {
-        Self::Quantized { weight, bias }
+        Self::Quantized {
+            weight,
+            bias,
+            mobile: None,
+        }
     }
 
     /// Load from weight map, auto-detecting quantization (affine mode)
@@ -1958,6 +1968,10 @@ impl UnifiedLinear {
         bits: i32,
         mode: &str,
     ) -> Result<Self, String> {
+        let (group_size, bits) = gemma_mobile::parameters(weights, prefix, group_size, bits, mode)
+            .map_err(|error| format!("{error}: {prefix}"))?;
+        let mobile = gemma_mobile::Activation::from_weights(weights, prefix)
+            .map_err(|error| format!("{error}: {prefix}"))?;
         let scales_name = format!("{}.scales", prefix);
 
         if weights.contains_key(&scales_name) {
@@ -2014,6 +2028,11 @@ impl UnifiedLinear {
 
             // Unfused LoRA terms staged for this layer (issue #1439).
             let runtime_loras = crate::runtime_lora::claim(prefix);
+            if mobile.is_some() && (global_scale.is_some() || !runtime_loras.is_empty()) {
+                return Err(format!(
+                    "Unsupported Gemma mobile scale or adapter: {prefix}"
+                ));
+            }
 
             let qweight = QuantizedWeight {
                 weight,
@@ -2032,6 +2051,7 @@ impl UnifiedLinear {
             Ok(Self::Quantized {
                 weight: qweight,
                 bias,
+                mobile,
             })
         } else {
             // Fallback to regular linear (non-quantized model)
@@ -2053,6 +2073,9 @@ impl UnifiedLinear {
 
     pub fn as_quantized_weight(&self) -> Option<&QuantizedWeight> {
         match self {
+            Self::Quantized {
+                mobile: Some(_), ..
+            } => None,
             // A layer with an active runtime-LoRA term must not be consumed
             // through its packed weight: every caller of this accessor feeds
             // a fused kernel that cannot add the low-rank term, so refusing
@@ -2106,7 +2129,18 @@ impl UnifiedLinear {
     /// The base projection, before any runtime-LoRA term.
     fn forward_inner(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
-            Self::Quantized { weight, bias } => {
+            Self::Quantized {
+                weight,
+                bias,
+                mobile,
+            } => {
+                if let Some(mobile) = mobile {
+                    return mobile.forward(
+                        x,
+                        weight,
+                        bias.as_ref().and_then(|value| value.as_ref()),
+                    );
+                }
                 // Native-NVFP4 global-scale path (issue #693): the per-tensor
                 // `weight_scale_2` multiplies only the matmul output, not the
                 // (rare) dense linear bias, so the C++ helper runs qmm, applies
@@ -2227,6 +2261,9 @@ impl UnifiedLinear {
     /// their composable fallback, where `forward` applies it.
     pub fn quantized_weight(&self) -> Option<&QuantizedWeight> {
         match self {
+            Self::Quantized {
+                mobile: Some(_), ..
+            } => None,
             Self::Quantized { weight, .. }
                 if crate::runtime_lora::any_active(&weight.runtime_loras) =>
             {
@@ -2262,7 +2299,15 @@ impl UnifiedLinear {
     )> {
         // An active runtime-LoRA term needs the composable path, where
         // `forward` adds it before the caller's own RoPE (issue #1439).
-        if self.has_active_runtime_lora() {
+        if self.has_active_runtime_lora()
+            || matches!(
+                self,
+                Self::Quantized {
+                    mobile: Some(_),
+                    ..
+                }
+            )
+        {
             return None;
         }
         match self {
@@ -2312,9 +2357,14 @@ impl UnifiedLinear {
     /// Used by: DFlash lazy binding for untied target `lm_head` projections.
     pub fn clone_shared(&self) -> Self {
         match self {
-            Self::Quantized { weight, bias } => Self::Quantized {
+            Self::Quantized {
+                weight,
+                bias,
+                mobile,
+            } => Self::Quantized {
                 weight: weight.clone_shared(),
                 bias: bias.as_ref().map(|b| ffi::copy(b)),
+                mobile: mobile.as_ref().map(gemma_mobile::Activation::clone_shared),
             },
             Self::Regular(linear) => Self::Regular(linear.clone_shared()),
         }
@@ -2633,6 +2683,15 @@ impl FusedQKVLinear {
         let k_prefix = format!("{}.k_proj", prefix);
         let v_prefix = format!("{}.v_proj", prefix);
 
+        if [&q_prefix, &k_prefix, &v_prefix]
+            .into_iter()
+            .any(|prefix| gemma_mobile::is_mobile(weights, prefix))
+        {
+            return Err(
+                "Gemma mobile QKV projections require separate activation rounding".to_owned(),
+            );
+        }
+
         let q_scales_key = format!("{}.scales", q_prefix);
         let is_quantized = weights.contains_key(&q_scales_key);
 
@@ -2826,6 +2885,7 @@ impl FusedQKVLinear {
             UnifiedLinear::Quantized {
                 weight: qweight,
                 bias: qkv_bias,
+                mobile: None,
             }
         } else {
             // Non-quantized path: concatenate weight tensors along axis 0.
@@ -6586,7 +6646,7 @@ mod tests {
             }
         };
         match fused_proj {
-            UnifiedLinear::Quantized { weight, bias } => {
+            UnifiedLinear::Quantized { weight, bias, .. } => {
                 let bias = bias.expect("Qwen2-style q/k/v linear bias must be preserved");
                 assert_eq!(ffi::array_shape(&bias).as_slice(), &[16]);
 

@@ -25,6 +25,9 @@
 //! - Final logit softcapping
 
 use crate::distributed::pipeline::LayerFilter;
+
+#[path = "gemma4_mobile.rs"]
+pub(crate) mod mobile;
 use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::model_owned::{KvCacheLayerModes, ModelOwnedSequenceState};
@@ -354,7 +357,7 @@ impl TextConfig {
 
 pub type RootQuantization = QuantizationArgs;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelArgs {
     pub model_type: String,
     pub text_config: serde_json::Value,
@@ -364,6 +367,49 @@ pub struct ModelArgs {
     pub quantization: Option<RootQuantization>,
     #[serde(default)]
     pub quantization_config: Option<serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for ModelArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            model_type: String,
+            text_config: serde_json::Value,
+            #[serde(default)]
+            eos_token_id: Option<serde_json::Value>,
+            #[serde(default)]
+            quantization: Option<RootQuantization>,
+            #[serde(default)]
+            quantization_config: Option<serde_json::Value>,
+        }
+
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if mobile::uses(&value) {
+            let tied = mobile::tied(&value).map_err(<D::Error as serde::de::Error>::custom)?;
+            let text = value
+                .get_mut("text_config")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom(mobile::Error::InvalidConfig)
+                })?;
+            text.insert(
+                "tie_word_embeddings".to_owned(),
+                serde_json::Value::Bool(tied),
+            );
+        }
+        let fields: Fields =
+            serde_json::from_value(value).map_err(<D::Error as serde::de::Error>::custom)?;
+        Ok(Self {
+            model_type: fields.model_type,
+            text_config: fields.text_config,
+            eos_token_id: fields.eos_token_id,
+            quantization: fields.quantization,
+            quantization_config: fields.quantization_config,
+        })
+    }
 }
 
 impl ModelArgs {
@@ -2607,7 +2653,11 @@ impl Attention {
         // in via the `shared_kv` argument to `forward`).  Constructing
         // k_proj/v_proj/k_norm for these layers wastes VRAM and mirrors what
         // upstream mlx-lm fixed in PR #1158 (commit 4f5cbd2).
-        let enable_fused_qkv = std::env::var_os("MLXCEL_GEMMA4_ENABLE_FUSED_QKV").is_some();
+        let enable_fused_qkv = mobile::fused_qkv_allowed(
+            weights,
+            prefix,
+            std::env::var_os("MLXCEL_GEMMA4_ENABLE_FUSED_QKV").is_some(),
+        );
         let projection = if is_kv_shared_layer {
             // Only q_proj is needed; K/V come from the shared KV cache.
             AttentionProjection::KvShared {
@@ -4222,7 +4272,10 @@ const DENSE_PREFILL_MASK_MAX_TOKENS: i32 = 4096;
 /// quantizing family now enforces at load. What stays here is the
 /// `quant_method` policy: the external-format rejection this function was added
 /// for and the ModelOpt NVFP4 exception that the gemma4 sanitize layer repacks.
-pub(crate) fn validate_quantization_scheme(config: &serde_json::Value) -> Result<(), String> {
+pub fn validate_quantization_scheme(config: &serde_json::Value) -> Result<(), String> {
+    if mobile::uses(config) {
+        return mobile::validate(config).map_err(|error| error.to_string());
+    }
     fn is_modelopt_nvfp4(obj: &serde_json::Value) -> bool {
         let method = obj
             .get("quant_method")
@@ -4320,6 +4373,7 @@ pub(crate) fn validate_quantization_scheme(config: &serde_json::Value) -> Result
 
 pub struct Gemma4Model {
     pub(crate) text_model: Gemma4TextModel,
+    mobile_lm_head: Option<UnifiedLinear>,
     pub(crate) config: TextConfig,
     pub(crate) eos_token_ids: Vec<i32>,
     _weight_backing: super::sanitize::Gemma4WeightBacking,
@@ -4352,7 +4406,7 @@ impl Gemma4Model {
                 super::sanitize::Gemma4WeightBacking::default(),
             )
         };
-        if is_quantized {
+        if is_quantized && !mobile::uses(&config_value) {
             super::sanitize::sanitize_gemma4_nvfp4_weights(&mut weights, Some(&config_value));
         }
         // Strip k_proj/v_proj/k_norm entries for KV-shared layers so the
@@ -4361,6 +4415,7 @@ impl Gemma4Model {
         // which bypasses load_text_weights and therefore does not
         // benefit from the strip already embedded in that function.
         crate::models::strip_gemma4_kv_shared_weights(&mut weights, &config_value);
+        mobile::prepare(&mut weights, &config_value).map_err(|error| error.to_string())?;
         crate::models::sanitize_tied_embeddings(&mut weights, &config_value);
         let mut model = Self::from_weights(&weights, &args)?;
         model._weight_backing = weight_backing;
@@ -4369,6 +4424,7 @@ impl Gemma4Model {
     }
 
     pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
+        let mobile_lm_head = mobile::load_head(weights, args)?;
         let config = args.text_args();
         let text_model = Gemma4TextModel::from_weights(weights, &config, "language_model.model")?;
         let eos_token_ids = {
@@ -4382,6 +4438,7 @@ impl Gemma4Model {
 
         Ok(Self {
             text_model,
+            mobile_lm_head,
             config,
             eos_token_ids,
             _weight_backing: super::sanitize::Gemma4WeightBacking::default(),
@@ -4399,7 +4456,7 @@ impl Gemma4Model {
         let hidden =
             self.text_model
                 .forward(input_ids, input_embeddings, caches, mask, per_layer_inputs);
-        let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
+        let mut logits = self.project_logits(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
         }
@@ -4433,7 +4490,7 @@ impl Gemma4Model {
             &[0, last_pos as i32, 0],
             &[shape[0], last_pos as i32 + 1, shape[2]],
         );
-        let mut logits = self.text_model.embed_tokens.as_linear(&last);
+        let mut logits = self.project_logits(&last);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
         }
@@ -4467,7 +4524,7 @@ impl Gemma4Model {
             None,
             None,
         );
-        let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
+        let mut logits = self.project_logits(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
         }
@@ -4509,7 +4566,7 @@ impl Gemma4Model {
             left_padding,
             per_row_valid_end,
         );
-        let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
+        let mut logits = self.project_logits(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
         }
@@ -4521,6 +4578,13 @@ impl Gemma4Model {
     /// Used by: Gemma 4 MTP drafter hidden preparation.
     fn speculative_draft_hidden(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.text_model.norm.forward(hidden)
+    }
+
+    fn project_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        match &self.mobile_lm_head {
+            Some(head) => head.forward(hidden),
+            None => self.text_model.embed_tokens.as_linear(hidden),
+        }
     }
 
     pub(crate) fn make_caches(&self) -> Vec<Cache> {
@@ -4565,6 +4629,9 @@ impl Gemma4StageModel {
         // up front rather than dequantizing them as affine and serving
         // degenerate output (issue #467).
         validate_quantization_scheme(&config_value)?;
+        if mobile::uses(&config_value) {
+            return Err("Gemma mobile pipeline stages are unsupported".to_owned());
+        }
 
         let is_quantized = super::sanitize::config_has_quantization_metadata(&config_value);
         let (mut weights, weight_backing) = if is_quantized {
