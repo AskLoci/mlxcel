@@ -516,8 +516,13 @@ mod tests {
         );
         weights.insert("projection.bias".to_owned(), ffi::copy(&bias));
         let layer = UnifiedLinear::from_weights(&weights, "projection", 64, 4)?;
+        let (modulus, midpoint, divisor) = if input_dtype == dtype::FLOAT16 {
+            (17, 8, 32.0)
+        } else {
+            (73, 36, 37.0)
+        };
         let data: Vec<f32> = (0..batch * 512)
-            .map(|index| ((index * 13 % 73) as i32 - 36) as f32 / 37.0)
+            .map(|index| ((index * 13 % modulus) as i32 - midpoint) as f32 / divisor)
             .collect();
         let input = ffi::astype(
             &ffi::from_slice_f32(&data, &[batch as i32, 512]),
