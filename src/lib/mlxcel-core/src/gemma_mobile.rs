@@ -481,6 +481,14 @@ mod tests {
     }
 
     fn assert_linear_batch(bits: i32, batch: usize) -> Result<(), Box<dyn std::error::Error>> {
+        assert_linear_batch_dtype(bits, batch, dtype::BFLOAT16)
+    }
+
+    fn assert_linear_batch_dtype(
+        bits: i32,
+        batch: usize,
+        input_dtype: i32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (packed, values) = packed_values(bits, 32, 512);
         let scales = ffi::astype(
             &ffi::from_slice_f32(
@@ -513,12 +521,12 @@ mod tests {
             .collect();
         let input = ffi::astype(
             &ffi::from_slice_f32(&data, &[batch as i32, 512]),
-            dtype::BFLOAT16,
+            input_dtype,
         );
         let accumulation = if batch < 32 {
             dtype::FLOAT32
         } else {
-            dtype::BFLOAT16
+            input_dtype
         };
         let dense = ffi::multiply(
             &ffi::astype(&ffi::from_slice_f32(&values, &[32, 512]), accumulation),
@@ -529,11 +537,21 @@ mod tests {
                 &ffi::matmul(&ffi::astype(&input, accumulation), &ffi::transpose(&dense)),
                 &ffi::astype(&bias, accumulation),
             ),
-            dtype::BFLOAT16,
+            input_dtype,
         );
         let actual = layer.forward(&input);
-        assert_eq!(ffi::array_dtype(&actual), dtype::BFLOAT16);
-        assert!(ffi::item_bool(&ffi::allclose(&actual, &expected, 0.0, 0.0)));
+        assert_eq!(ffi::array_dtype(&actual), input_dtype);
+        assert!(
+            ffi::item_bool(&ffi::allclose(&actual, &expected, 0.0, 0.0)),
+            "bits={bits}, batch={batch}, dtype={input_dtype}, differences={:?}",
+            crate::utils::array_to_vec_f32(&actual)
+                .into_iter()
+                .zip(crate::utils::array_to_vec_f32(&expected))
+                .enumerate()
+                .filter(|(_, (actual, expected))| actual != expected)
+                .take(12)
+                .collect::<Vec<_>>()
+        );
         let batched = layer.forward(&ffi::reshape(&input, &[1, batch as i32, 512]));
         assert!(ffi::item_bool(&ffi::allclose(
             &ffi::reshape(&batched, &[batch as i32, 32]),
@@ -550,6 +568,16 @@ mod tests {
         for bits in [2, 4, 8] {
             assert_linear_batch(bits, 31)?;
             assert_linear_batch(bits, 32)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn linear_preserves_float16_31_and_32_row_dtype_and_bias_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for bits in [2, 4, 8] {
+            assert_linear_batch_dtype(bits, 31, dtype::FLOAT16)?;
+            assert_linear_batch_dtype(bits, 32, dtype::FLOAT16)?;
         }
         Ok(())
     }

@@ -1852,7 +1852,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   if (M >= vector_limit) {
     // Use split-K qmm for small M with transposed weights (non-batched only)
     int B = out.size() / M / N;
-    if (transpose_ && B == 1) {
+    if (transpose_ && B == 1 && x.dtype() == float32) {
       qmm_splitk(
           x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s, mode);
       return;
