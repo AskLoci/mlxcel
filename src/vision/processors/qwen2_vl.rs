@@ -334,10 +334,18 @@ impl Qwen2VLProcessor {
     }
 
     pub fn with_image_config(
-        mut self,
+        self,
         config: QwenImageProcessorConfig,
     ) -> Result<Self, QwenImageError> {
-        self.validate_image_config(&config)?;
+        self.with_image_config_policy(config, crate::vision::image_token_overrides::installed())
+    }
+
+    fn with_image_config_policy(
+        mut self,
+        config: QwenImageProcessorConfig,
+        token_override: Option<&crate::vision::image_token_overrides::ImageTokenOverride>,
+    ) -> Result<Self, QwenImageError> {
+        self.validate_image_config_policy(&config, token_override)?;
         self.image_config = Some(config);
         Ok(self)
     }
@@ -350,6 +358,15 @@ impl Qwen2VLProcessor {
         &self,
         config: &QwenImageProcessorConfig,
     ) -> Result<(), QwenImageError> {
+        self.validate_image_config_policy(config, crate::vision::image_token_overrides::installed())
+    }
+
+    fn validate_image_config_policy(
+        &self,
+        config: &QwenImageProcessorConfig,
+        token_override: Option<&crate::vision::image_token_overrides::ImageTokenOverride>,
+    ) -> Result<(), QwenImageError> {
+        config.validate_token_override(token_override)?;
         if self.patch_size != config.patch_size as usize
             || self.temporal_patch_size != config.temporal_patch_size as usize
             || self.spatial_merge_size != config.merge_size as usize
@@ -652,6 +669,7 @@ mod configured_image_tests {
     use super::{
         Qwen2VLMediaInput, Qwen2VLProcessor, QwenImageError, QwenImageProcessorConfig, tensor_shape,
     };
+    use crate::vision::image_token_overrides::ImageTokenOverride;
     use image::{DynamicImage, Rgb, RgbImage};
     use serde_json::json;
 
@@ -784,6 +802,42 @@ mod configured_image_tests {
         assert_eq!(base().image_config(), None);
         let installed = base().with_image_config(expected.clone())?;
         assert_eq!(installed.image_config(), Some(&expected));
+        Ok(())
+    }
+
+    #[test]
+    fn configured_image_boundaries_reject_token_overrides() -> Result<(), QwenImageError> {
+        let profile = QwenImageProcessorConfig::from_processor_config(&json!({
+            "image_processor_type":"Qwen2VLImageProcessorFast", "patch_size":16,
+            "temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],
+            "image_std":[0.5,0.5,0.5],
+            "size":{"shortest_edge":65536,"longest_edge":16777216}
+        }))?;
+        assert_eq!(profile.image_grid(1024, 1024)?, (1, 64, 64));
+        let processor = Qwen2VLProcessor::new_with_norm(16, 2, 2, [0.5; 3], [0.5; 3])
+            .with_image_config_policy(profile.clone(), None)?;
+        assert_eq!(processor.image_config(), Some(&profile));
+        for (minimum, maximum) in [
+            (None, Some(256)),
+            (Some(256), None),
+            (Some(64), Some(256)),
+            (None, Some(0)),
+        ] {
+            let token_override = ImageTokenOverride::from_bounds(minimum, maximum);
+            assert_eq!(
+                profile.validate_token_override(token_override.as_ref()),
+                Err(QwenImageError::TokenOverride)
+            );
+            assert!(matches!(
+                Qwen2VLProcessor::new_with_norm(16, 2, 2, [0.5; 3], [0.5; 3])
+                    .with_image_config_policy(profile.clone(), token_override.as_ref()),
+                Err(QwenImageError::TokenOverride)
+            ));
+            assert_eq!(
+                processor.validate_image_config_policy(&profile, token_override.as_ref()),
+                Err(QwenImageError::TokenOverride)
+            );
+        }
         Ok(())
     }
 

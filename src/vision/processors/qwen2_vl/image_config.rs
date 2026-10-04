@@ -6,6 +6,7 @@ use std::io::Read;
 use std::path::Path;
 
 use super::fast_bicubic;
+use crate::vision::image_token_overrides::ImageTokenOverride;
 
 const MAX_PIXELS: u32 = 16_777_216;
 const MAX_INPUT_PIXELS: u64 = 268_435_456;
@@ -63,6 +64,7 @@ pub enum QwenImageError {
     Capacity,
     PixelFormat,
     Sidecar,
+    TokenOverride,
 }
 
 impl Display for QwenImageError {
@@ -73,6 +75,9 @@ impl Display for QwenImageError {
             Self::Capacity => "Qwen image preprocessing capacity exceeded",
             Self::PixelFormat => "unsupported Qwen image pixel format",
             Self::Sidecar => "invalid Qwen image processor sidecar",
+            Self::TokenOverride => {
+                "image-token overrides are unsupported for configured Qwen images"
+            }
         })
     }
 }
@@ -91,6 +96,16 @@ pub struct QwenImageProcessorConfig {
 }
 
 impl QwenImageProcessorConfig {
+    pub(crate) fn validate_token_override(
+        &self,
+        token_override: Option<&ImageTokenOverride>,
+    ) -> Result<(), QwenImageError> {
+        if token_override.is_some() {
+            return Err(QwenImageError::TokenOverride);
+        }
+        Ok(())
+    }
+
     pub fn from_model_path(path: &Path) -> Result<Option<Self>, QwenImageError> {
         let processor = read_sidecar(path, "processor_config.json")?;
         let preprocessor = read_sidecar(path, "preprocessor_config.json")?;

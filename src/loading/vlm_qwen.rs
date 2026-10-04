@@ -413,6 +413,9 @@ fn load_qwen3_5_vlm_with_variant(
 
     let image_config =
         vision::processors::qwen2_vl::QwenImageProcessorConfig::from_model_path(model_path)?;
+    if let Some(config) = &image_config {
+        config.validate_token_override(vision::image_token_overrides::installed())?;
+    }
 
     let mut vision_config: Qwen3VLVisionConfig =
         parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3.5 vision config")?;
