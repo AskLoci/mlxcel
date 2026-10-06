@@ -134,13 +134,22 @@ impl QwenImageProcessorConfig {
     pub fn from_processor_config(config: &Value) -> Result<Self, QwenImageError> {
         let config = config.get("image_processor").unwrap_or(config);
         validate_operations(config)?;
-        let size = config.get("size").ok_or(QwenImageError::Configuration)?;
+        let (min_pixels, max_pixels) = match config.get("size") {
+            Some(size) => (
+                positive_integer(size, "shortest_edge")?,
+                positive_integer(size, "longest_edge")?,
+            ),
+            None => (
+                positive_integer(config, "min_pixels")?,
+                positive_integer(config, "max_pixels")?,
+            ),
+        };
         let resolved = Self {
             patch_size: positive_integer(config, "patch_size")?,
             temporal_patch_size: positive_integer(config, "temporal_patch_size")?,
             merge_size: positive_integer(config, "merge_size")?,
-            min_pixels: positive_integer(size, "shortest_edge")?,
-            max_pixels: positive_integer(size, "longest_edge")?,
+            min_pixels,
+            max_pixels,
             mean: channel_values(config, "image_mean")?,
             std: channel_values(config, "image_std")?,
         };
@@ -353,9 +362,10 @@ fn channel_values(config: &Value, key: &str) -> Result<[f32; 3], QwenImageError>
 }
 
 fn validate_operations(config: &Value) -> Result<(), QwenImageError> {
-    if config.get("image_processor_type").and_then(Value::as_str)
-        != Some("Qwen2VLImageProcessorFast")
-    {
+    if !matches!(
+        config.get("image_processor_type").and_then(Value::as_str),
+        Some("Qwen2VLImageProcessorFast" | "Qwen3VLImageProcessor")
+    ) {
         return Err(QwenImageError::Configuration);
     }
     for name in ["do_resize", "do_rescale", "do_normalize", "do_convert_rgb"] {
@@ -440,6 +450,42 @@ mod tests {
                 Err(QwenImageError::Configuration)
             );
         }
+    }
+
+    #[test]
+    fn qwen3_vl_processor_bounds_resolve_to_the_same_profile() -> Result<(), QwenImageError> {
+        let processor = json!({"image_processor":{"do_convert_rgb":true, "do_normalize":true,
+            "do_rescale":true, "image_mean":[0.5,0.5,0.5],
+            "image_processor_type":"Qwen3VLImageProcessor", "image_std":[0.5,0.5,0.5],
+            "max_pixels":16777216, "merge_size":2, "min_pixels":65536, "patch_size":16,
+            "rescale_factor":0.00392156862745098, "temporal_patch_size":2},
+            "processor_class":"Qwen3VLProcessor"});
+        let preprocessor = pinned_config();
+        assert_eq!(
+            QwenImageProcessorConfig::from_sidecars(Some(&processor), Some(&preprocessor))?,
+            Some(QwenImageProcessorConfig::from_processor_config(&preprocessor)?)
+        );
+        let mut unbounded = processor.clone();
+        if let Some(config) = unbounded["image_processor"].as_object_mut() {
+            config.remove("max_pixels");
+        }
+        assert_eq!(
+            QwenImageProcessorConfig::from_sidecars(Some(&unbounded), None),
+            Err(QwenImageError::Configuration)
+        );
+        let mut wider = processor.clone();
+        wider["image_processor"]["max_pixels"] = json!(8388608);
+        assert_eq!(
+            QwenImageProcessorConfig::from_sidecars(Some(&wider), Some(&preprocessor)),
+            Err(QwenImageError::Configuration)
+        );
+        let mut renamed = processor;
+        renamed["image_processor"]["image_processor_type"] = json!("Qwen3VLImageProcessorSlow");
+        assert_eq!(
+            QwenImageProcessorConfig::from_sidecars(Some(&renamed), None),
+            Err(QwenImageError::Configuration)
+        );
+        Ok(())
     }
 
     #[test]
