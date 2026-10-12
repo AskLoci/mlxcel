@@ -33,8 +33,11 @@ function(mlx_apply_source_overlays mlx_source_dir)
   # `use_qmv_wide` (issue #1187). Upstream has no equivalent knob and the
   # predicate is unchanged as of pin 9a795735, so it has to be overlaid here.
   # Refresh the file wholesale on a bump and re-apply that one hunk.
+  # kernels/CMakeLists.txt selects the iOS SDK and AIR target for cross-builds.
+  # Refresh from the pinned upstream file and preserve that target selection.
   set(_metal_patch_files
       "mlx/backend/metal/compiled.cpp"
+      "mlx/backend/metal/kernels/CMakeLists.txt"
       "mlx/backend/metal/kernels/utils.h"
       "mlx/backend/metal/quantized.cpp")
   foreach(_patch_file ${_metal_patch_files})
@@ -153,6 +156,29 @@ foreach(_pf ${_all_patches})
 endforeach()
 
 add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
+
+# Simulator SDKs omit these optional error-domain constants. These two headers
+# are verbatim upstream mlx-swift PR354, not local C++ changes:
+# https://github.com/ml-explore/mlx-swift/tree/164a5f50b5106b79253de64cc0af3ad73e2e2a9a/Source/Cmlx/metal-cpp/Metal
+# SHA256 MTLIOCommandQueue.hpp: 9b56a8bb0d55674d2c81fff834206f618bfb074a5a0c697f7cfaa2d2e7209785
+# SHA256 MTLTensor.hpp: 1790f8c1ec459b535c5beb985b58844b43b7b132a9a0274859aa4651f27d57cb
+# Their upstream dlsym fallback preserves null for unavailable constants while
+# leaving the Metal framework and every required symbol strongly linked.
+string(TOLOWER "${CMAKE_OSX_SYSROOT}" _mlx_metal_sysroot)
+if(MLX_BUILD_METAL AND CMAKE_SYSTEM_NAME STREQUAL "iOS"
+   AND _mlx_metal_sysroot MATCHES "iphonesimulator")
+  FetchContent_GetProperties(metal_cpp SOURCE_DIR _mlx_metal_cpp_source_dir)
+  if(NOT EXISTS "${_mlx_metal_cpp_source_dir}/Metal/MTLPrivate.hpp")
+    message(FATAL_ERROR "MLX did not provide the expected Metal-cpp headers")
+  endif()
+  foreach(_header MTLIOCommandQueue.hpp MTLTensor.hpp)
+    configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/patches/metal_cpp/Metal/${_header}"
+      "${_mlx_metal_cpp_source_dir}/Metal/${_header}"
+      COPYONLY)
+  endforeach()
+endif()
+
 
 # ----------------------------- CUDA CCCL ---------------------------------
 # Ensure MLX_CCCL_DIR is defined for CUDA JIT kernel compilation at runtime.
