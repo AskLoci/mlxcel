@@ -27,3 +27,6 @@
 
 #[path = "../../mlxcel-core/build_support/mlx_pin.rs"]
 pub mod mlx_pin;
+
+#[path = "../../mlxcel-core/build_support/apple_target.rs"]
+pub mod apple_target;

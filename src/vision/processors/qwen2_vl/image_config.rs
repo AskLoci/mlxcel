@@ -463,7 +463,9 @@ mod tests {
         let preprocessor = pinned_config();
         assert_eq!(
             QwenImageProcessorConfig::from_sidecars(Some(&processor), Some(&preprocessor))?,
-            Some(QwenImageProcessorConfig::from_processor_config(&preprocessor)?)
+            Some(QwenImageProcessorConfig::from_processor_config(
+                &preprocessor
+            )?)
         );
         let mut unbounded = processor.clone();
         if let Some(config) = unbounded["image_processor"].as_object_mut() {

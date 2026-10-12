@@ -184,7 +184,7 @@ pub(super) fn resize(
         pass(intermediate, height, false)
     } else {
         let mut output = allocate(width, height)?;
-        output.as_mut().copy_from_slice(intermediate.as_raw());
+        output.copy_from_slice(intermediate.as_raw());
         Ok(output)
     }
 }
