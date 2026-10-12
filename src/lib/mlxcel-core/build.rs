@@ -25,6 +25,15 @@ use std::{env, path::PathBuf};
 mod mlx_pin;
 
 fn main() {
+    // Nothing this script runs may act on the repository the build happens to
+    // be started from. Git hands `GIT_DIR` and friends to hooks, `git rebase
+    // -x` and `git bisect run`, and with them inherited the MLX checkout that
+    // CMake's FetchContent runs lands on the caller's repository instead of the
+    // fresh clone; see `remove_git_discovery_env`.
+    //
+    // SAFETY: first statement of `main`, so no other thread exists yet.
+    unsafe { mlx_pin::remove_git_discovery_env() };
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 

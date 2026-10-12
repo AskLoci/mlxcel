@@ -258,7 +258,10 @@ pub fn cache_state(marker_contents: Option<&str>, expected_commit: &str) -> Cach
 /// `git bisect run`, so any `cargo build` reached through one of those inherits
 /// it. The `.git` probe above defends against discovery walking *up*; this
 /// defends against it being redirected *sideways*.
-const GIT_DISCOVERY_ENV: &[&str] = &[
+///
+/// `remove_git_discovery_env` removes the same variables for everything else
+/// the build script runs, the CMake fetch of MLX first of all.
+pub const GIT_DISCOVERY_ENV: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -269,6 +272,40 @@ const GIT_DISCOVERY_ENV: &[&str] = &[
     "GIT_CEILING_DIRECTORIES",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
 ];
+
+/// Remove [`GIT_DISCOVERY_ENV`] from this process's own environment, so every
+/// child started afterwards runs without them.
+///
+/// `head_command` clears the variables on the one `Command` it builds. The
+/// CMake run cannot be covered that way: the `cmake` crate builds its commands
+/// itself and can set a variable on them but not remove one, and the `git`
+/// calls that matter are further down still, inside FetchContent. Its
+/// generated script runs `git clone --no-checkout`, then `git checkout <pin>
+/// --` and `git submodule update --recursive --init` inside the clone.
+/// `git clone` ignores `GIT_DIR`; the other two obey it. With the `GIT_DIR` of
+/// a linked worktree inherited, the checkout looks for the pinned MLX commit in
+/// the repository the build was started from and dies with `fatal: unable to
+/// read tree (<pin>)`. With only the absolute `GIT_INDEX_FILE` that
+/// `git commit -a` hands a hook, it reads the caller's pending index as the
+/// clone's own and stops with `Your local changes to the following files would
+/// be overwritten by checkout`.
+///
+/// The build script has no use for the variables: nothing it runs is meant to
+/// act on the repository it happens to be started from. Removing them from the
+/// process covers the CMake configure and build steps, the MLX dependencies
+/// that FetchContent clones the same way, and every other child alike.
+///
+/// # Safety
+///
+/// `std::env::remove_var` is unsound while another thread reads or writes the
+/// environment. Call this while the process is still single-threaded.
+pub unsafe fn remove_git_discovery_env() {
+    for name in GIT_DISCOVERY_ENV {
+        // SAFETY: the caller guarantees no other thread touches the
+        // environment, see above.
+        unsafe { std::env::remove_var(name) };
+    }
+}
 
 /// Build the `git rev-parse HEAD` invocation the HEAD probe runs.
 ///
@@ -871,6 +908,30 @@ mod tests {
                 "{name} must be cleared for the HEAD probe, cleared: {cleared:?}"
             );
         }
+    }
+
+    /// `remove_git_discovery_env` helps only if the build script calls it
+    /// before the first child that can reach `git`, and its safety contract
+    /// holds only before the first thread. `build.rs` cannot be run from a
+    /// unit test (running it builds MLX), so the order is pinned in its source:
+    /// the call is the first statement of `main`. What the call achieves is
+    /// covered by `mlxcel-mlx-pin/tests/git_env_isolation.rs`.
+    #[test]
+    fn the_build_script_removes_the_variables_before_anything_else() {
+        let build_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../mlxcel-core/build.rs");
+        let source = std::fs::read_to_string(&build_rs).expect("in-tree build.rs must be readable");
+        let main_body = source
+            .split_once("fn main() {")
+            .expect("build.rs must define main")
+            .1;
+        let first_statement = main_body
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("//"));
+        assert_eq!(
+            first_statement,
+            Some("unsafe { mlx_pin::remove_git_discovery_env() };")
+        );
     }
 
     #[test]
