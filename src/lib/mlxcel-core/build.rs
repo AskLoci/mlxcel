@@ -21,8 +21,11 @@ use std::{env, path::PathBuf};
 // Single-source-of-truth resolution and verification of the pinned MLX commit.
 // Shared by path (not by dependency) with `mlxcel-mlx-pin`, which unit-tests it
 // without dragging in an MLX build; see that crate's manifest for the reason.
+#[path = "build_support/apple_target.rs"]
+mod apple_target;
 #[path = "build_support/mlx_pin.rs"]
 mod mlx_pin;
+use apple_target::AppleTarget;
 
 fn main() {
     // Nothing this script runs may act on the repository the build happens to
@@ -61,8 +64,16 @@ fn main() {
     let cuda_arch = resolve_cuda_architectures();
     println!("cargo:rustc-env=MLXCEL_CUDA_ARCHITECTURES={cuda_arch}");
 
+    // Build scripts run on the host; Cargo's target selects SDKs and libraries.
+    let target = env::var("TARGET").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let apple = AppleTarget::from_triple(&target);
+    if matches!(target_os.as_str(), "macos" | "ios") && apple.is_none() {
+        panic!("mlxcel-core: unsupported Apple target {target}");
+    }
+
     // Build MLX using cmake
-    let mlx_dst = build_mlx(&mlx_commit, &cuda_arch);
+    let mlx_dst = build_mlx(&mlx_commit, &cuda_arch, apple);
     // Verify what actually landed on disk before blessing it. CMake reuses an
     // already-populated _deps/mlx-src rather than re-running FetchContent, so a
     // checkout restored from a CI cache or seeded by hand can disagree with the
@@ -72,8 +83,25 @@ fn main() {
     let mlx_include = mlx_dst.join("build/include");
     let mlx_lib = mlx_dst.join("build/lib");
 
-    // Build the cxx bridge with optimization flags
-    let mut bridge = cxx_build::bridge("src/lib.rs");
+    // iOS apps carry their exact target's shaders in the executable, so plain
+    // Cargo and dx builds do not depend on a separate resource-copying task.
+    let mut bridge_sources = vec!["src/lib.rs"];
+    if target_os == "ios" && env::var_os("CARGO_FEATURE_METAL").is_some() {
+        let metallib = mlx_lib.join("mlx.metallib");
+        assert!(
+            metallib.is_file(),
+            "mlxcel-core: iOS Metal build did not install {}",
+            metallib.display()
+        );
+        println!(
+            "cargo:rustc-env=MLXCEL_EMBEDDED_METALLIB={}",
+            metallib.display()
+        );
+        bridge_sources.push("src/metal_resource.rs");
+    }
+
+    // Build the cxx bridge with optimization flags.
+    let mut bridge = cxx_build::bridges(bridge_sources);
     bridge
         .file("cpp/mlx_cxx_bridge.cpp")
         // Bridge implementation split out of mlx_cxx_bridge.cpp by domain
@@ -164,18 +192,18 @@ fn main() {
             .flag_if_supported("-DNDEBUG")
             .flag_if_supported("-ffast-math");
         // ISA baseline for the bridge C++. Defaults to the build host's ISA
-        // (-march=native), which is correct for builds that run where they
-        // are built (developer machines, the per-machine gb10/gh200 release
-        // assets). Redistributable release builds must override this with a
+        // (-march=native) only for native builds; cross-builds use the target
+        // baseline. Native builds include developer machines and gb10/gh200 release
+        // assets. Redistributable release builds must override this with a
         // portable baseline via MLXCEL_CXX_MARCH (e.g. "x86-64-v3" for the
         // generic Linux x86-64 asset), otherwise the binary inherits the
         // build runner's ISA (possibly AVX-512) and SIGILLs on older CPUs.
         // Set MLXCEL_CXX_MARCH=none to omit the flag entirely.
         match env::var("MLXCEL_CXX_MARCH").as_deref() {
-            Err(_) => {
+            Err(_) if env::var("HOST").ok().as_deref() == Some(target.as_str()) => {
                 bridge.flag_if_supported("-march=native");
             }
-            Ok("none") => {}
+            Err(_) | Ok("none") => {}
             Ok(march) => {
                 bridge.flag_if_supported(format!("-march={march}"));
             }
@@ -183,8 +211,9 @@ fn main() {
         // On macOS, Clang produces LLVM bitcode with -flto, which is compatible
         // with Rust's LLVM LTO. On Linux with GCC, -flto produces GIMPLE IR
         // objects that are incompatible, causing undefined-reference linker errors.
-        #[cfg(target_os = "macos")]
-        bridge.flag_if_supported("-flto");
+        if apple.is_some() {
+            bridge.flag_if_supported("-flto");
+        }
     }
 
     bridge.compile("mlx_cxx_bridge");
@@ -194,28 +223,44 @@ fn main() {
     println!("cargo:rustc-link-lib=static=mlx");
 
     // Platform-specific system libraries
-    #[cfg(target_os = "macos")]
-    {
+    if let Some(apple) = apple {
         println!("cargo:rustc-link-lib=c++");
         println!("cargo:rustc-link-lib=dylib=objc");
         println!("cargo:rustc-link-lib=framework=Foundation");
 
         // Link clang compiler-rt for ___isPlatformVersionAtLeast
         // (required by MLX C++ @available() runtime checks)
-        if let Ok(output) = std::process::Command::new("clang")
-            .arg("--print-runtime-dir")
+        let output = std::process::Command::new("xcrun")
+            .args(["--sdk", apple.sdk(), "clang", "--print-runtime-dir"])
             .output()
-        {
-            let runtime_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !runtime_dir.is_empty() {
-                println!("cargo:rustc-link-search=native={runtime_dir}");
-                println!("cargo:rustc-link-lib=static=clang_rt.osx");
-            }
+            .unwrap_or_else(|error| {
+                panic!("mlxcel-core: failed to find compiler runtime: {error}")
+            });
+        if !output.status.success() {
+            panic!(
+                "mlxcel-core: compiler runtime query failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
+        let runtime_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if runtime_dir.is_empty() {
+            panic!("mlxcel-core: compiler runtime query returned no directory");
+        }
+        println!("cargo:rustc-link-search=native={runtime_dir}");
+        // iOS compiler runtimes are universal archives. Let the Apple linker
+        // choose the target slice instead of bundling one into the Rust rlib.
+        let runtime_kind = if apple == AppleTarget::MacOs {
+            "static"
+        } else {
+            "static:-bundle"
+        };
+        println!(
+            "cargo:rustc-link-lib={runtime_kind}={}",
+            apple.compiler_runtime()
+        );
     }
 
-    #[cfg(target_os = "linux")]
-    {
+    if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
         // CPU backend needs BLAS/LAPACK on Linux
         println!("cargo:rustc-link-lib=dylib=openblas");
@@ -223,9 +268,8 @@ fn main() {
     }
 
     // Backend-specific linking
-    #[cfg(target_os = "macos")]
-    {
-        // Metal and Accelerate are always linked on macOS
+    if apple.is_some() {
+        // Both Apple targets use the same Metal and Accelerate backends.
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
@@ -237,6 +281,8 @@ fn main() {
 
     // Rerun if bridge files change
     println!("cargo:rerun-if-changed=src/lib.rs");
+    println!("cargo:rerun-if-changed=src/metal_resource.rs");
+    println!("cargo:rerun-if-changed=build_support/apple_target.rs");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.h");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_internal.h");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.cpp");
@@ -349,33 +395,43 @@ fn mark_mlx_cache_valid(out_dir: &std::path::Path, expected_commit: &str) {
 
 // `cuda_architectures` is consumed only by the CUDA branch below.
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
-fn build_mlx(expected_commit: &str, cuda_architectures: &str) -> PathBuf {
+fn build_mlx(
+    expected_commit: &str,
+    cuda_architectures: &str,
+    apple: Option<AppleTarget>,
+) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     purge_stale_mlx_cache(&out_dir, expected_commit);
 
     let mut config = Config::new("../mlx-cpp");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
+    if matches!(
+        apple,
+        Some(AppleTarget::IosDevice | AppleTarget::IosSimulator)
+    ) {
+        println!("cargo:rerun-if-env-changed=IPHONEOS_DEPLOYMENT_TARGET");
+        if let Ok(deployment_target) = env::var("IPHONEOS_DEPLOYMENT_TARGET") {
+            // Keep Rust, the C++ bridge, CMake sources, and AIR at one minimum.
+            config.define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
+        }
+    }
 
     // Platform features
-    // On macOS: Metal and Accelerate are always available and enabled by default.
+    // On Apple targets: Metal and Accelerate are enabled by default.
     // Feature flags can still override (e.g. for CPU-only testing).
     // On Linux: CPU-only by default, CUDA opt-in via feature flag.
     config.define("MLX_BUILD_CUDA", "OFF");
 
-    #[cfg(target_os = "macos")]
-    {
+    if apple.is_some() {
         let build_metal = cmake_bool_from_env("MLXCEL_BUILD_METAL").unwrap_or("ON");
         let build_accelerate = cmake_bool_from_env("MLXCEL_BUILD_ACCELERATE").unwrap_or("ON");
 
-        // Default to Metal + Accelerate on macOS, but allow CPU-only rebuilds
+        // Default to Metal + Accelerate on Apple targets, but allow CPU-only rebuilds
         // for environments where Metal device enumeration is unavailable.
         config.define("MLX_BUILD_METAL", build_metal);
         config.define("MLX_BUILD_ACCELERATE", build_accelerate);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
+    } else {
         config.define("MLX_BUILD_METAL", "OFF");
         config.define("MLX_BUILD_ACCELERATE", "OFF");
     }
@@ -412,8 +468,7 @@ fn build_mlx(expected_commit: &str, cuda_architectures: &str) -> PathBuf {
     config.build()
 }
 
-// Used by the macOS configuration block above; dead on non-macOS targets.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+// Used when the Cargo target selects an Apple backend.
 fn cmake_bool_from_env(name: &str) -> Option<&'static str> {
     let value = env::var(name).ok()?;
     match value.trim().to_ascii_lowercase().as_str() {

@@ -2965,6 +2965,11 @@ mod ffi {
 // Re-export the FFI types and functions
 pub use ffi::*;
 
+#[cfg(all(target_os = "ios", feature = "metal"))]
+mod metal_resource;
+#[cfg(all(target_os = "ios", feature = "metal"))]
+pub use metal_resource::{embedded_metallib, set_metallib_path};
+
 /// Deprecated name for [`default_device_is_gpu`] (issue #1421).
 ///
 /// The old name read as a hardware query, but the answer is whether the
