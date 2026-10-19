@@ -672,6 +672,12 @@ mod ffi {
         /// Used by: Gemma3 residual connections
         fn compiled_clip_residual(x: &MlxArray, y: &MlxArray) -> UniquePtr<MlxArray>;
 
+        /// Compiled Gemma mobile static-range activation rounding: round
+        /// `input / scale` into the int8 range and scale it back, as one
+        /// fused kernel; a zero (uncalibrated) scale returns the input.
+        /// Used by: gemma_mobile::Activation::forward (Gemma 4 QAT mobile)
+        fn compiled_gemma_mobile_srq(input: &MlxArray, scale: &MlxArray) -> UniquePtr<MlxArray>;
+
         /// Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
         /// Used by: Gemma2 attention with logit softcapping
         unsafe fn compiled_softcap_sdpa(

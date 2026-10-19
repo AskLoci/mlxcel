@@ -332,15 +332,13 @@ fn accumulation_dtype(shape: &[i32], original: i32) -> i32 {
     }
 }
 
+/// Static-range activation rounding: `input / scale` rounded into the int8
+/// range and scaled back, in the input's dtype; a zero (uncalibrated) scale
+/// leaves the input unchanged. One compiled MLX function per call, so each
+/// side of a quantized linear costs one fused kernel at decode instead of
+/// eleven eager ones.
 fn srq(input: &MlxArray, scale: &MlxArray) -> UniquePtr<MlxArray> {
-    let scale = ffi::astype(scale, ffi::array_dtype(input));
-    let calibrated = ffi::not_equal(&scale, &ffi::zeros_like(&scale));
-    let safe = ffi::where_cond(&calibrated, &scale, &ffi::ones_like(&scale));
-    let rounded = ffi::round(&ffi::divide(input, &safe));
-    let lower = ffi::full_like(&scale, -128.0);
-    let upper = ffi::full_like(&scale, 127.0);
-    let quantized = ffi::multiply(&ffi::clip(&rounded, &lower, &upper), &safe);
-    ffi::where_cond(&calibrated, &quantized, input)
+    ffi::compiled_gemma_mobile_srq(input, scale)
 }
 
 #[cfg(test)]
@@ -384,6 +382,17 @@ mod tests {
             storage,
             values.into_iter().map(|value| value as f32).collect(),
         )
+    }
+
+    fn eager_srq(input: &ffi::MlxArray, scale: &ffi::MlxArray) -> cxx::UniquePtr<ffi::MlxArray> {
+        let scale = ffi::astype(scale, ffi::array_dtype(input));
+        let calibrated = ffi::not_equal(&scale, &ffi::zeros_like(&scale));
+        let safe = ffi::where_cond(&calibrated, &scale, &ffi::ones_like(&scale));
+        let rounded = ffi::round(&ffi::divide(input, &safe));
+        let lower = ffi::full_like(&scale, -128.0);
+        let upper = ffi::full_like(&scale, 127.0);
+        let quantized = ffi::multiply(&ffi::clip(&rounded, &lower, &upper), &safe);
+        ffi::where_cond(&calibrated, &quantized, input)
     }
 
     #[test]
@@ -624,9 +633,9 @@ mod tests {
                 &values.iter().map(|value| value * 0.125).collect::<Vec<_>>(),
                 &[32, 128],
             );
-            let expected = srq(
+            let expected = eager_srq(
                 &ffi::add(
-                    &ffi::matmul(&srq(&input, &input_scale), &ffi::transpose(&dense)),
+                    &ffi::matmul(&eager_srq(&input, &input_scale), &ffi::transpose(&dense)),
                     &bias,
                 ),
                 &output_scale,
@@ -686,6 +695,31 @@ mod tests {
             dtype::FLOAT16
         );
         assert_eq!(accumulation_dtype(&[128], dtype::BFLOAT16), dtype::FLOAT32);
+    }
+
+    #[test]
+    fn compiled_rounding_matches_eager_for_every_runtime_dtype_and_scale_state() {
+        let data: Vec<f32> = (0..4096_usize)
+            .map(|index| ((index * 13 % 73) as i32 - 36) as f32 * 7.25)
+            .collect();
+        for input_dtype in [dtype::FLOAT32, dtype::FLOAT16, dtype::BFLOAT16] {
+            for scale_dtype in [dtype::FLOAT32, dtype::BFLOAT16] {
+                for scale_value in [0.0, 0.5, 2.0] {
+                    for shape in [&[4, 1024][..], &[1, 2, 2048][..], &[4096][..]] {
+                        let input = ffi::astype(&ffi::from_slice_f32(&data, shape), input_dtype);
+                        let scale = ffi::full_f32(&[], scale_value, scale_dtype);
+                        let actual = ffi::compiled_gemma_mobile_srq(&input, &scale);
+                        let expected = eager_srq(&input, &scale);
+                        assert_eq!(ffi::array_dtype(&actual), input_dtype);
+                        assert_eq!(ffi::array_shape(&actual), shape);
+                        assert!(
+                            ffi::item_bool(&ffi::allclose(&actual, &expected, 0.0, 0.0)),
+                            "input={input_dtype}, scale={scale_dtype}, value={scale_value}, shape={shape:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

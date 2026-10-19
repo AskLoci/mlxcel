@@ -1749,6 +1749,42 @@ std::unique_ptr<MlxArray> compiled_clip_residual(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
+// Compiled Gemma mobile static-range activation rounding: round(input / scale)
+// clipped to the int8 range and scaled back, as one fused kernel per linear
+// side instead of eleven eager ones. Every constant takes the scale's dtype,
+// which is cast to the input's first, so the result keeps the input dtype and
+// the eager chain's arithmetic exactly. A zero (uncalibrated) scale returns
+// the input unchanged.
+// Used by: gemma_mobile::Activation::forward (Gemma 4 E2B/E4B QAT mobile)
+namespace {
+    static CompiledArrayFn get_compiled_gemma_mobile_srq() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& input = inputs[0];
+            auto scale = mlx::core::astype(inputs[1], input.dtype());
+            auto calibrated = mlx::core::not_equal(scale, mlx::core::zeros_like(scale));
+            auto safe = mlx::core::where(calibrated, scale, mlx::core::ones_like(scale));
+            auto rounded = mlx::core::round(mlx::core::divide(input, safe));
+            auto quantized = mlx::core::multiply(
+                mlx::core::clip(
+                    rounded,
+                    mlx::core::full_like(scale, -128.0f),
+                    mlx::core::full_like(scale, 127.0f)),
+                safe);
+            return {mlx::core::where(calibrated, quantized, input)};
+        };
+        return compile_shapeless_audited("compiled_gemma_mobile_srq", fn);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gemma_mobile_srq(
+    const MlxArray& input,
+    const MlxArray& scale
+) {
+    static auto compiled_fn = get_compiled_gemma_mobile_srq();
+    auto result = compiled_fn({input.inner, scale.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
 // Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V.
 // Used by: Gemma2 attention with logit softcapping
 namespace {
