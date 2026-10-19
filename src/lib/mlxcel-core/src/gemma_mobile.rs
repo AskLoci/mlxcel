@@ -3,6 +3,7 @@ use crate::ffi::{self, MlxArray};
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
 use std::fmt;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -334,13 +335,26 @@ fn accumulation_dtype(shape: &[i32], original: i32) -> i32 {
 
 /// Static-range activation rounding with the surrounding dtype casts folded
 /// in: the input cast to `rounding`, `input / scale` rounded into the int8
-/// range and scaled back there, and the result cast to `result`, as one
-/// compiled MLX function; a zero (uncalibrated) scale leaves the cast input
-/// unchanged. A cast to the dtype already held costs nothing inside the
-/// compiled graph, so each side of a quantized linear is one fused kernel
-/// whether or not the small-batch float32 accumulation path is taken.
+/// range and scaled back there, and the result cast to `result`; a zero
+/// (uncalibrated) scale leaves the cast input unchanged. On Metal this is one
+/// custom kernel, a single primitive per call; elsewhere, or with
+/// `MLXCEL_GEMMA_MOBILE_SRQ_COMPILED=1`, the same arithmetic as one compiled
+/// MLX function. Either way each side of a quantized linear is one kernel
+/// whether or not the small-batch float32 accumulation path is taken. The
+/// custom kernel exists because a compiled function costs about 14
+/// microseconds of host time per call on an M5 Max against about 2.5 for
+/// the kernel, and a decoded token calls this ~680 times.
 fn srq_cast(input: &MlxArray, scale: &MlxArray, rounding: i32, result: i32) -> UniquePtr<MlxArray> {
-    ffi::compiled_gemma_mobile_srq(input, scale, rounding, result)
+    static CUSTOM_KERNEL: OnceLock<bool> = OnceLock::new();
+    let custom = *CUSTOM_KERNEL.get_or_init(|| {
+        ffi::metal_is_available()
+            && std::env::var_os("MLXCEL_GEMMA_MOBILE_SRQ_COMPILED").is_none_or(|value| value != "1")
+    });
+    if custom {
+        ffi::custom_gemma_mobile_srq(input, scale, rounding, result)
+    } else {
+        ffi::compiled_gemma_mobile_srq(input, scale, rounding, result)
+    }
 }
 
 #[cfg(test)]
@@ -747,42 +761,63 @@ mod tests {
         assert_eq!(accumulation_dtype(&[128], dtype::BFLOAT16), dtype::FLOAT32);
     }
 
+    type Rounding = fn(&ffi::MlxArray, &ffi::MlxArray, i32, i32) -> cxx::UniquePtr<ffi::MlxArray>;
+
+    /// Every rounding implementation on this machine, named: the compiled
+    /// function everywhere, the custom Metal kernel where Metal is available,
+    /// and the one `forward` picks between them.
+    fn implementations() -> Vec<(&'static str, Rounding)> {
+        let mut implementations: Vec<(&'static str, Rounding)> = vec![
+            ("compiled", ffi::compiled_gemma_mobile_srq),
+            ("forward", srq_cast),
+        ];
+        if ffi::metal_is_available() {
+            implementations.push(("custom", ffi::custom_gemma_mobile_srq));
+        }
+        implementations
+    }
+
     #[test]
-    fn compiled_rounding_matches_eager_for_every_runtime_dtype_and_scale_state() {
+    fn every_rounding_matches_eager_for_every_runtime_dtype_and_scale_state() {
         let data: Vec<f32> = (0..4096_usize)
             .map(|index| ((index * 13 % 73) as i32 - 36) as f32 * 7.25)
             .collect();
         let runtime_dtypes = [dtype::FLOAT32, dtype::FLOAT16, dtype::BFLOAT16];
-        for input_dtype in runtime_dtypes {
-            for scale_dtype in [dtype::FLOAT32, dtype::BFLOAT16] {
-                for scale_value in [0.0, 0.5, 2.0] {
-                    for shape in [&[4, 1024][..], &[1, 2, 2048][..], &[4096][..]] {
-                        let input = ffi::astype(&ffi::from_slice_f32(&data, shape), input_dtype);
-                        let scale = ffi::full_f32(&[], scale_value, scale_dtype);
-                        let actual = srq(&input, &scale);
-                        let expected = eager_srq(&input, &scale);
-                        assert_eq!(ffi::array_dtype(&actual), input_dtype);
-                        assert_eq!(ffi::array_shape(&actual), shape);
-                        assert!(
-                            ffi::item_bool(&ffi::allclose(&actual, &expected, 0.0, 0.0)),
-                            "input={input_dtype}, scale={scale_dtype}, value={scale_value}, shape={shape:?}"
-                        );
-                        // The folded casts: rounding in one runtime dtype and
-                        // leaving in another equals the eager chain with an
-                        // eager cast on each side of it.
-                        for rounding in runtime_dtypes {
-                            for result in runtime_dtypes {
-                                let actual = srq_cast(&input, &scale, rounding, result);
-                                let expected = ffi::astype(
-                                    &eager_srq(&ffi::astype(&input, rounding), &scale),
-                                    result,
-                                );
-                                assert_eq!(ffi::array_dtype(&actual), result);
-                                assert_eq!(ffi::array_shape(&actual), shape);
-                                assert!(
-                                    ffi::item_bool(&ffi::allclose(&actual, &expected, 0.0, 0.0)),
-                                    "input={input_dtype}, scale={scale_dtype}, value={scale_value}, shape={shape:?}, rounding={rounding}, result={result}"
-                                );
+        for (name, implementation) in implementations() {
+            for input_dtype in runtime_dtypes {
+                for scale_dtype in [dtype::FLOAT32, dtype::BFLOAT16] {
+                    for scale_value in [0.0, 0.5, 2.0] {
+                        for shape in [&[4, 1024][..], &[1, 2, 2048][..], &[4096][..]] {
+                            let input =
+                                ffi::astype(&ffi::from_slice_f32(&data, shape), input_dtype);
+                            let scale = ffi::full_f32(&[], scale_value, scale_dtype);
+                            let actual = implementation(&input, &scale, input_dtype, input_dtype);
+                            let expected = eager_srq(&input, &scale);
+                            assert_eq!(ffi::array_dtype(&actual), input_dtype);
+                            assert_eq!(ffi::array_shape(&actual), shape);
+                            assert!(
+                                ffi::item_bool(&ffi::allclose(&actual, &expected, 0.0, 0.0)),
+                                "{name}: input={input_dtype}, scale={scale_dtype}, value={scale_value}, shape={shape:?}"
+                            );
+                            // The folded casts: rounding in one runtime dtype
+                            // and leaving in another equals the eager chain
+                            // with an eager cast on each side of it.
+                            for rounding in runtime_dtypes {
+                                for result in runtime_dtypes {
+                                    let actual = implementation(&input, &scale, rounding, result);
+                                    let expected = ffi::astype(
+                                        &eager_srq(&ffi::astype(&input, rounding), &scale),
+                                        result,
+                                    );
+                                    assert_eq!(ffi::array_dtype(&actual), result);
+                                    assert_eq!(ffi::array_shape(&actual), shape);
+                                    assert!(
+                                        ffi::item_bool(&ffi::allclose(
+                                            &actual, &expected, 0.0, 0.0
+                                        )),
+                                        "{name}: input={input_dtype}, scale={scale_dtype}, value={scale_value}, shape={shape:?}, rounding={rounding}, result={result}"
+                                    );
+                                }
                             }
                         }
                     }

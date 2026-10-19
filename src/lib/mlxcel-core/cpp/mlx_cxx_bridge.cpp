@@ -1811,6 +1811,66 @@ std::unique_ptr<MlxArray> compiled_gemma_mobile_srq(
     return std::make_unique<MlxArray>(std::move(outputs[0]));
 }
 
+// The same Gemma mobile rounding as one custom Metal kernel: a single
+// primitive per call instead of a compiled tape. The arithmetic mirrors the
+// compiled chain op for op in the rounding dtype `T`: the scale and the
+// input cast to `T`, divide, rint, the float maximum and minimum MLX's clip
+// uses, multiply, the uncalibrated (zero scale) pass-through, then the cast
+// to the result dtype `R`.
+// Used by: gemma_mobile::Activation::forward (Gemma 4 E2B/E4B QAT mobile)
+namespace {
+    const std::string& gemma_mobile_srq_kernel_source() {
+        static const std::string source = R"(
+    uint index = thread_position_in_grid.x;
+    T scaled = static_cast<T>(scale);
+    T value = static_cast<T>(input[index]);
+    if (scaled != static_cast<T>(0)) {
+        T rounded = metal::rint(value / scaled);
+        T lower = static_cast<T>(-128);
+        T upper = static_cast<T>(127);
+        rounded = metal::isnan(rounded) ? rounded : (rounded > lower ? rounded : lower);
+        rounded = metal::isnan(rounded) ? rounded : (rounded < upper ? rounded : upper);
+        value = rounded * scaled;
+    }
+    out[index] = static_cast<R>(value);
+)";
+        return source;
+    }
+
+    mlx::core::fast::CustomKernelFunction& gemma_mobile_srq_kernel() {
+        static auto kernel = mlx::core::fast::metal_kernel(
+            "gemma_mobile_srq",
+            {"input", "scale"},
+            {"out"},
+            gemma_mobile_srq_kernel_source());
+        return kernel;
+    }
+}
+
+std::unique_ptr<MlxArray> custom_gemma_mobile_srq(
+    const MlxArray& input,
+    const MlxArray& scale,
+    int32_t rounding,
+    int32_t result
+) {
+    const auto result_dtype = to_dtype(result);
+    if (input.inner.size() == 0) {
+        return std::make_unique<MlxArray>(mlx::core::astype(input.inner, result_dtype));
+    }
+    const int count = static_cast<int>(input.inner.size());
+    auto outputs = gemma_mobile_srq_kernel()(
+        {input.inner, scale.inner},
+        {input.inner.shape()},
+        {result_dtype},
+        std::make_tuple(count, 1, 1),
+        std::make_tuple(std::min(count, 256), 1, 1),
+        {{"T", to_dtype(rounding)}, {"R", result_dtype}},
+        std::nullopt,
+        false,
+        {});
+    return std::make_unique<MlxArray>(std::move(outputs[0]));
+}
+
 // Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V.
 // Used by: Gemma2 attention with logit softcapping
 namespace {

@@ -569,6 +569,16 @@ std::unique_ptr<MlxArray> compiled_gemma_mobile_srq(
     int32_t result
 );
 
+// The same Gemma mobile rounding as one custom Metal kernel (one primitive
+// per call instead of a compiled tape), op for op the compiled chain.
+// Used by: gemma_mobile::Activation::forward (Gemma 4 E2B/E4B QAT mobile)
+std::unique_ptr<MlxArray> custom_gemma_mobile_srq(
+    const MlxArray& input,
+    const MlxArray& scale,
+    int32_t rounding,
+    int32_t result
+);
+
 // Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
 // Used by: Gemma2 attention with logit softcapping
 std::unique_ptr<MlxArray> compiled_softcap_sdpa(

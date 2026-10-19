@@ -686,6 +686,17 @@ mod ffi {
             result: i32,
         ) -> UniquePtr<MlxArray>;
 
+        /// The same Gemma mobile rounding as one custom Metal kernel: one
+        /// primitive per call instead of a compiled tape, op for op the
+        /// compiled chain.
+        /// Used by: gemma_mobile::Activation::forward (Gemma 4 QAT mobile)
+        fn custom_gemma_mobile_srq(
+            input: &MlxArray,
+            scale: &MlxArray,
+            rounding: i32,
+            result: i32,
+        ) -> UniquePtr<MlxArray>;
+
         /// Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
         /// Used by: Gemma2 attention with logit softcapping
         unsafe fn compiled_softcap_sdpa(
