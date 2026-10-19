@@ -1749,18 +1749,24 @@ std::unique_ptr<MlxArray> compiled_clip_residual(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
-// Compiled Gemma mobile static-range activation rounding: round(input / scale)
-// clipped to the int8 range and scaled back, as one fused kernel per linear
-// side instead of eleven eager ones. Every constant takes the scale's dtype,
-// which is cast to the input's first, so the result keeps the input dtype and
-// the eager chain's arithmetic exactly. A zero (uncalibrated) scale returns
-// the input unchanged.
+// Compiled Gemma mobile static-range activation rounding: `input / scale`
+// rounded into the int8 range and scaled back, as one fused kernel. The
+// chain runs in `rounding`: the input is cast to it first and the scale
+// after, so every constant takes the scale's dtype after that cast and the
+// result keeps the eager chain's arithmetic exactly. A zero (uncalibrated)
+// scale returns the cast input unchanged. The result is cast to `result`
+// inside the same kernel, which lets a quantized linear fold the two dtype
+// casts of its small-batch float32 accumulation path into the roundings:
+// the input side rounds in the activation dtype and leaves in float32, the
+// output side returns from float32 and rounds in the activation dtype, one
+// dispatch each instead of two. A cast to the dtype an array already holds
+// is free inside the graph, so the pair (x, x) is the plain rounding.
 // Used by: gemma_mobile::Activation::forward (Gemma 4 E2B/E4B QAT mobile)
 namespace {
-    static CompiledArrayFn get_compiled_gemma_mobile_srq() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            const auto& input = inputs[0];
-            auto scale = mlx::core::astype(inputs[1], input.dtype());
+    static CompiledArrayFn make_compiled_gemma_mobile_srq(Dtype rounding, Dtype result) {
+        auto fn = [rounding, result](const std::vector<array>& inputs) -> std::vector<array> {
+            auto input = mlx::core::astype(inputs[0], rounding);
+            auto scale = mlx::core::astype(inputs[1], rounding);
             auto calibrated = mlx::core::not_equal(scale, mlx::core::zeros_like(scale));
             auto safe = mlx::core::where(calibrated, scale, mlx::core::ones_like(scale));
             auto rounded = mlx::core::round(mlx::core::divide(input, safe));
@@ -1770,19 +1776,39 @@ namespace {
                     mlx::core::full_like(scale, -128.0f),
                     mlx::core::full_like(scale, 127.0f)),
                 safe);
-            return {mlx::core::where(calibrated, quantized, input)};
+            return {mlx::core::astype(
+                mlx::core::where(calibrated, quantized, input), result)};
         };
-        return compile_shapeless_audited("compiled_gemma_mobile_srq", fn);
+        std::ostringstream site;
+        site << "compiled_gemma_mobile_srq[" << rounding << "->" << result << "]";
+        return compile_shapeless_audited(site.str().c_str(), fn);
+    }
+
+    // One compiled function per (rounding, result) dtype pair, built on first
+    // use; the map's references stay valid across later insertions, so a call
+    // runs outside the lock.
+    static const CompiledArrayFn& compiled_gemma_mobile_srq_for(Dtype rounding, Dtype result) {
+        static std::mutex mutex;
+        static std::map<std::pair<int32_t, int32_t>, CompiledArrayFn> table;
+        std::lock_guard<std::mutex> lock(mutex);
+        auto key = std::make_pair(from_dtype(rounding), from_dtype(result));
+        auto found = table.find(key);
+        if (found == table.end()) {
+            found = table.emplace(key, make_compiled_gemma_mobile_srq(rounding, result)).first;
+        }
+        return found->second;
     }
 }
 
 std::unique_ptr<MlxArray> compiled_gemma_mobile_srq(
     const MlxArray& input,
-    const MlxArray& scale
+    const MlxArray& scale,
+    int32_t rounding,
+    int32_t result
 ) {
-    static auto compiled_fn = get_compiled_gemma_mobile_srq();
-    auto result = compiled_fn({input.inner, scale.inner});
-    return std::make_unique<MlxArray>(std::move(result[0]));
+    const auto& compiled_fn = compiled_gemma_mobile_srq_for(to_dtype(rounding), to_dtype(result));
+    auto outputs = compiled_fn({input.inner, scale.inner});
+    return std::make_unique<MlxArray>(std::move(outputs[0]));
 }
 
 // Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V.

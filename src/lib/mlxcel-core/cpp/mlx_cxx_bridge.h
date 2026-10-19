@@ -557,13 +557,16 @@ std::unique_ptr<MlxArray> compiled_clip_residual(
     const MlxArray& y
 );
 
-// Compiled Gemma mobile static-range activation rounding: round(input / scale)
-// clipped to the int8 range and scaled back, as one fused kernel. A zero
-// (uncalibrated) scale returns the input unchanged.
+// Compiled Gemma mobile static-range activation rounding: the input cast to
+// `rounding`, round(input / scale) clipped to the int8 range and scaled back
+// there, and the result cast to `result`, as one fused kernel. A zero
+// (uncalibrated) scale returns the cast input unchanged.
 // Used by: gemma_mobile::Activation::forward (Gemma 4 E2B/E4B QAT mobile)
 std::unique_ptr<MlxArray> compiled_gemma_mobile_srq(
     const MlxArray& input,
-    const MlxArray& scale
+    const MlxArray& scale,
+    int32_t rounding,
+    int32_t result
 );
 
 // Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
